@@ -70,9 +70,21 @@ class Strategy:
     source: str = ""              # 考案者・出典（有名手法）や、GA の探索の記録
     param_grid: tuple = ()        # ウォークフォワードで試すパラメータの候補（IndicatorParams を上書きする dict）。空なら初期値だけ
     spec: dict = field(default_factory=dict, compare=False, hash=False)  # ルールを再現するための情報（試行記録に残す）
+    # 元のルールの決済（有名手法など）。キー：sl_atr / tp_atr（None なら使わない）/ max_bars / opposite_exit。空なら共通の設定
+    exits: dict = field(default_factory=dict, compare=False, hash=False)
+    # 決済シグナル（+1 = 買いポジションを決済、−1 = 売りポジションを決済、2 = どちらも、0 = なし）。その足までのデータで計算
+    exit_func: Callable[[pd.DataFrame, IndicatorParams], pd.Series] | None = field(default=None, compare=False, hash=False)
+    # 「初期パラメータ」として共通の設定を上書きするもの（例：タートルズの N は ATR20 なので {"atr_period": 20}）。
+    # 最初からある5つの戦略では空（共通の初期値を使う）
+    defaults: dict = field(default_factory=dict, compare=False, hash=False)
 
     def grid(self) -> list[dict]:
-        return list(self.param_grid) or [{}]
+        return list(self.param_grid) or [dict(self.defaults)]
+
+    def params(self, base: IndicatorParams) -> IndicatorParams:
+        """この戦略の初期パラメータ。"""
+        from dataclasses import replace
+        return replace(base, **self.defaults) if self.defaults else base
 
 
 # 最初からある5つの戦略のパラメータ候補（ウォークフォワードで、学習区間ごとに最も良いものを選ぶ）
@@ -111,6 +123,13 @@ def signals(ind: pd.DataFrame, strategy: Strategy, p: IndicatorParams, n_confirm
     if n_confirmed is not None:
         s.iloc[n_confirmed:] = 0
     return s
+
+
+def exit_signals(ind: pd.DataFrame, strategy: Strategy, p: IndicatorParams) -> list[int] | None:
+    """戦略に決済シグナルがあれば、各足の値（+1 / −1 / 2 / 0）のリスト。なければ None。"""
+    if strategy.exit_func is None:
+        return None
+    return strategy.exit_func(ind, p).fillna(0).astype(int).tolist()
 
 
 def levels(entry: float, direction: int, atr: float, risk: RiskParams) -> tuple[float, float]:

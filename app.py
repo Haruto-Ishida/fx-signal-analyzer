@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from dashboard import backtest_tab, ml_tab, signals_tab, tracking_tab
+from dashboard import backtest_tab, famous_tab, ml_tab, signals_tab, tracking_tab
 from dashboard.common import JST, Context
 from fxtool import data, events, indicators, jobs, tracking, trials
 from fxtool import settings as user_settings
@@ -147,8 +147,8 @@ m2.metric(f"ATR（{P.atr_period}）", f"{last_c['atr'] / ctx.pip:.1f} pips",
           help="1本の足の平均的な値幅。損切り・利確の幅の基準です。")
 m3.metric("最新の確定足", ctx.label(ind.index[n_conf - 1]))
 
-tab_signals, tab_backtest, tab_ml, tab_tracking = st.tabs(
-    ["📡 現在のシグナル", "🧪 バックテスト", "🤖 機械学習予測", "📒 記録と成績"]
+tab_signals, tab_backtest, tab_ml, tab_tracking, tab_famous = st.tabs(
+    ["📡 現在のシグナル", "🧪 バックテスト", "🤖 機械学習予測", "📒 記録と成績", "📚 有名手法"]
 )
 with tab_signals:
     signals_tab.render(ctx)
@@ -158,3 +158,5 @@ with tab_ml:
     ml_tab.render(ctx)
 with tab_tracking:
     tracking_tab.render(ctx)
+with tab_famous:
+    famous_tab.render(ctx)

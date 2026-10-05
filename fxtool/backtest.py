@@ -79,9 +79,11 @@ TRADE_FIELDS = ["dir", "signal_i", "entry_i", "exit_i", "entry", "exit", "sl", "
 
 def simulate_raw(
     bars: Bars, sig: list[int], risk: RiskParams, rules: ExitRules, costs: Costs, pip: float,
-    start: int = 0, end: int | None = None,
+    start: int = 0, end: int | None = None, exit_sig: list[int] | None = None,
 ) -> list[tuple]:
-    """[start, end) の範囲だけで売買する。範囲の終わりで持っているポジションはその足の終値で決済する。"""
+    """[start, end) の範囲だけで売買する。範囲の終わりで持っているポジションはその足の終値で決済する。
+
+    exit_sig（有名手法などの決済のルール）：その足の終値で exit_sig が持っている方向（または 2）なら、次の足の始値で決済する。"""
     end = bars.n if end is None else end
     o, h, l, c, atr = bars.o, bars.h, bars.l, bars.c, bars.atr
     cost = costs.round_trip
@@ -108,6 +110,9 @@ def simulate_raw(
             if rules.max_bars and j - e + 1 >= rules.max_bars:
                 reason, px, exit_j, next_k = "期限", c[j], j, j
                 break
+            if exit_sig is not None and exit_sig[j] in (d, 2) and j + 1 < end:
+                reason, px, exit_j, next_k = "決済シグナル", o[j + 1], j + 1, j
+                break
             if rules.opposite_exit and sig[j] == -d and j + 1 < end:
                 reason, px, exit_j, next_k = "反対シグナル", o[j + 1], j + 1, j
                 break
@@ -122,8 +127,26 @@ def simulate_raw(
 
 
 def simulate(bars: Bars, sig: list[int], risk: RiskParams, rules: ExitRules, costs: Costs, pip: float,
-             start: int = 0, end: int | None = None) -> pd.DataFrame:
-    return pd.DataFrame(simulate_raw(bars, sig, risk, rules, costs, pip, start, end), columns=TRADE_FIELDS)
+             start: int = 0, end: int | None = None, exit_sig: list[int] | None = None) -> pd.DataFrame:
+    return pd.DataFrame(simulate_raw(bars, sig, risk, rules, costs, pip, start, end, exit_sig), columns=TRADE_FIELDS)
+
+
+NO_BARRIER = 1e6  # 「使わない」損切り・利確（ATR の 100万倍。実際には届かない）
+
+
+def strategy_exits(st: Strategy, risk: RiskParams, rules: ExitRules) -> tuple[RiskParams, ExitRules]:
+    """戦略に元のルールの決済（exits）があればそれを、なければ共通の設定を使う。"""
+    e = st.exits
+    if not e:
+        return risk, rules
+    def barrier(name, default):
+        v = e.get(name, default)
+        return NO_BARRIER if v is None else float(v)
+    r = RiskParams(sl_atr=barrier("sl_atr", risk.sl_atr), tp_atr=barrier("tp_atr", risk.tp_atr),
+                   valid_bars=risk.valid_bars)
+    ru = ExitRules(opposite_exit=bool(e.get("opposite_exit", rules.opposite_exit)),
+                   max_bars=int(e.get("max_bars", rules.max_bars)))
+    return r, ru
 
 
 def metrics(pips) -> dict:
@@ -165,11 +188,11 @@ def signal_rate(sig: list[int], start: int, end: int) -> float:
 
 def random_baseline(
     bars: Bars, windows: list[tuple[int, int, float]], risk: RiskParams, rules: ExitRules, costs: Costs,
-    pip: float, runs: int = 200, seed: int = 0, curves: bool = False,
+    pip: float, runs: int = 200, seed: int = 0, curves: bool = False, exit_sig: list[int] | None = None,
 ) -> tuple[pd.DataFrame, np.ndarray | None]:
     """ランダム売買を runs 回行う。windows は (開始, 終了, 1本あたりのシグナル発生率) のリスト。
 
-    方向は買い・売りを半々でランダムに決め、決済ルールとコストは戦略と同じにする。
+    方向は買い・売りを半々でランダムに決め、決済ルール（exit_sig を含む）とコストは戦略と同じにする。
     戻り値：試行ごとの成績（metrics の列）と、curves=True なら累積損益の 5/50/95% 点（3 × n）。
     """
     rng = np.random.default_rng(seed)
@@ -183,7 +206,7 @@ def random_baseline(
         sig_l = sig.tolist()
         trades = []
         for a, b, _ in windows:
-            trades += simulate_raw(bars, sig_l, risk, rules, costs, pip, a, b)
+            trades += simulate_raw(bars, sig_l, risk, rules, costs, pip, a, b, exit_sig)
         pips = [t[9] for t in trades]
         rows.append(metrics(pips))
         if curves:
@@ -227,8 +250,13 @@ def random_walk_baseline(ohlc: pd.DataFrame, base: IndicatorParams, risk: RiskPa
         bars = Bars(ind, mult)
         row = {}
         for st in sts:
-            sig = strategies.signals(ind, st, base).tolist()
-            row[st.key] = sum(t[9] for t in simulate_raw(bars, sig, risk, rules, costs, pip, WARMUP, len(ind)))
+            p = st.params(base)  # その戦略の初期パラメータ（最初からある5つの戦略では共通の初期値）
+            ind_p = ind if p == base else indicators.add_all(ind[["open", "high", "low", "close"]], p)
+            bars_p = bars if p == base else Bars(ind_p, mult)
+            rs, ru = strategy_exits(st, risk, rules)
+            sig = strategies.signals(ind_p, st, p).tolist()
+            row[st.key] = sum(t[9] for t in simulate_raw(bars_p, sig, rs, ru, costs, pip, WARMUP, len(ind_p),
+                                                         strategies.exit_signals(ind_p, st, p)))
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -253,6 +281,7 @@ class Candidate:
     params: IndicatorParams
     bars: Bars
     sig: list[int]
+    exit_sig: list[int] | None = None
 
 
 def candidates(raw: pd.DataFrame, strategy: Strategy, base: IndicatorParams,
@@ -264,7 +293,8 @@ def candidates(raw: pd.DataFrame, strategy: Strategy, base: IndicatorParams,
         if p not in cache:
             cache[p] = indicators.add_all(raw, p)
         ind = cache[p]
-        out.append(Candidate(ov, p, Bars(ind, mult), strategies.signals(ind, strategy, p).tolist()))
+        out.append(Candidate(ov, p, Bars(ind, mult), strategies.signals(ind, strategy, p).tolist(),
+                             strategies.exit_signals(ind, strategy, p)))
     return out
 
 
@@ -308,19 +338,20 @@ def walk_forward(
     mult=None,
 ) -> WalkForwardResult:
     """各学習区間で損益合計が最大のパラメータを選び（取引が min_trades 回未満の候補は除外）、
-    直後の検証区間でそのまま使ったときの成績を測る。"""
+    直後の検証区間でそのまま使ったときの成績を測る。戦略に元のルールの決済（exits・exit_func）があればそれを使う。"""
+    risk, rules = strategy_exits(strategy, risk, rules)
     cands = candidates(raw, strategy, base, cache, mult)
     folds = []
     for (a, b), (b2, c) in make_folds(len(raw), k, train_mult):
         best, best_m, best_score = cands[0], None, -math.inf
         cand_ms = []
         for cand in cands:
-            m = metrics([t[9] for t in simulate_raw(cand.bars, cand.sig, risk, rules, costs, pip, a, b)])
+            m = metrics([t[9] for t in simulate_raw(cand.bars, cand.sig, risk, rules, costs, pip, a, b, cand.exit_sig)])
             cand_ms.append(m)
             score = m["total"] if m["n"] >= min_trades else -math.inf
             if best_m is None or score > best_score:
                 best, best_m, best_score = cand, m, score
-        test = simulate(best.bars, best.sig, risk, rules, costs, pip, b2, c)
+        test = simulate(best.bars, best.sig, risk, rules, costs, pip, b2, c, best.exit_sig)
         folds.append(Fold((a, b), (b2, c), best.overrides, best_m, test, signal_rate(best.sig, b2, c), cand_ms))
 
     test_trades = pd.concat([f.test_trades for f in folds], ignore_index=True)
@@ -398,16 +429,24 @@ def evaluate_all(
     rw = (random_walk_baseline(raw, base, risk, rules, costs, pip, rw_paths, seed=7, strategy_list=sts,
                                mult=spread_mult) if rw_paths else pd.DataFrame())
     for i, st in enumerate(sts):
-        sig = strategies.signals(ind, st, base).tolist()
-        full = simulate(bars, sig, risk, rules, costs, pip, WARMUP, n)
+        # その戦略の初期パラメータと、元のルールの決済（なければ共通の設定）
+        p_st = st.params(base)
+        if p_st not in cache:
+            cache[p_st] = indicators.add_all(raw, p_st)
+        ind_st = cache[p_st]
+        bars_st = bars if p_st == base else Bars(ind_st, spread_mult)
+        rs, ru = strategy_exits(st, risk, rules)
+        xs = strategies.exit_signals(ind_st, st, p_st)
+        sig = strategies.signals(ind_st, st, p_st).tolist()
+        full = simulate(bars_st, sig, rs, ru, costs, pip, WARMUP, n, xs)
         fm = metrics(full["pips"])
         rate = signal_rate(sig, WARMUP, n)
         rates.append(rate)
-        full_rand, _ = random_baseline(bars, [(WARMUP, n, rate)], risk, rules, costs, pip, runs, seed=i)
+        full_rand, _ = random_baseline(bars_st, [(WARMUP, n, rate)], rs, ru, costs, pip, runs, seed=i, exit_sig=xs)
 
         wf = walk_forward(raw, st, base, risk, rules, costs, pip, k, train_mult, cache=cache, mult=spread_mult)
         wf_windows = [(f.test[0], f.test[1], f.test_rate) for f in wf.folds]
-        wf_rand, _ = random_baseline(bars, wf_windows, risk, rules, costs, pip, runs, seed=100 + i)
+        wf_rand, _ = random_baseline(bars_st, wf_windows, rs, ru, costs, pip, runs, seed=100 + i, exit_sig=xs)
         wf_beat = beat_ratio(wf.test_metrics["total"], wf_rand["total"])
 
         def exit_times(t: pd.DataFrame) -> pd.Index:
@@ -420,7 +459,7 @@ def evaluate_all(
 
         # PBO 用：この戦略の全パラメータ候補を、開発用データ全体で動かした日ごとの損益
         for cand in candidates(raw, st, base, cache, spread_mult):
-            t = simulate(cand.bars, cand.sig, risk, rules, costs, pip, WARMUP, n)
+            t = simulate(cand.bars, cand.sig, rs, ru, costs, pip, WARMUP, n, cand.exit_sig)
             grid[f"{st.key}|{describe_params(st.key, cand.overrides)}"] = overfit.daily_pnl(exit_times(t), t["pips"], days)
 
         reports.append(StrategyReport(
@@ -465,23 +504,25 @@ def planned_trials(base: IndicatorParams, risk: RiskParams, rules: ExitRules,
 
     sts = list(strategy_list) if strategy_list is not None else strategies.STRATEGIES
     return [{"family": "strategy", "name": st.key,
-             "config": strategy_config(st.key, replace(base, **ov), risk, rules, spec=st.spec)}
+             "config": strategy_config(st.key, replace(base, **ov), *strategy_exits(st, risk, rules), spec=st.spec)}
             for st in sts for ov in st.grid()]
 
 
 def trial_rows(reports: list[StrategyReport], base: IndicatorParams, risk: RiskParams, rules: ExitRules) -> list[dict]:
-    """全期間（初期パラメータ）と、ウォークフォワードで試した全候補を、試行として記録する形にする。"""
+    """全期間（初期パラメータ）と、ウォークフォワードで試した全候補を、試行として記録する形にする。
+    戦略ごとの初期パラメータと決済のルールで記録する（最初からある5つの戦略は共通の設定なので、以前と同じ形）。"""
     from .trials import strategy_config
 
     rows = []
     for r in reports:
         st = r.strategy
+        rs, ru = strategy_exits(st, risk, rules)
         rows.append({"family": "strategy", "name": st.key, "purpose": "full_period",
-                     "config": strategy_config(st.key, base, risk, rules, spec=st.spec),
+                     "config": strategy_config(st.key, st.params(base), rs, ru, spec=st.spec),
                      "metrics": {**r.full_metrics, "beat_random": r.full_beat}})
         for j, ov in enumerate(st.grid()):
             rows.append({"family": "strategy", "name": st.key, "purpose": "wf_candidate",
-                         "config": strategy_config(st.key, replace(base, **ov), risk, rules, spec=st.spec),
+                         "config": strategy_config(st.key, replace(base, **ov), rs, ru, spec=st.spec),
                          "metrics": {"train_total_by_fold": [f.candidate_metrics[j]["total"] for f in r.wf.folds],
                                      "selected_folds": [i for i, f in enumerate(r.wf.folds) if f.overrides == ov]}})
     return rows
