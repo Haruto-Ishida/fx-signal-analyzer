@@ -21,7 +21,8 @@ import numpy as np
 import pandas as pd
 
 from . import backtest as bt
-from . import data, holdout, indicators, ml, ml_eval, strategies, tracking, trials
+from . import costmodel, data, holdout, indicators, ml, ml_eval, strategies, tracking, trials
+from . import settings as user_settings
 from .config import (
     DAILY_MAX_LOSS_R, DEFAULT_SLIPPAGE, DEFAULT_SPREAD, LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, ML_META_FOLDS,
     ML_META_THRESHOLD, MODELS_DIR, PAIRS, ROOT, TIMEFRAMES, TRACKING, VERTICAL_BARRIER, WEEKLY_MAX_LOSS_R,
@@ -337,7 +338,10 @@ def exit_rules(tf_key: str) -> bt.ExitRules:
 
 
 def verdicts_due(con, pair, tf_key, ind_dev, n_trials: int) -> bool:
-    """開発用データ（境界で固定）の最後の足で計算した判定がまだないか、試した数が増えて DSR の割り引きが古くなったら計算する。"""
+    """開発用データ（境界で固定）の最後の足で計算した判定がまだないか、試した数が増えて DSR の割り引きが古くなったか、
+    コストの見積もり方が変わったら計算する。"""
+    if tracking.get_state(con, pair, tf_key, "verdict_cost_model") != costmodel.COST_MODEL_VERSION:
+        return True
     rows = con.execute(
         "SELECT n_trials FROM backtest_verdicts WHERE pair=? AND tf=? AND bar_time=? AND n_trials IS NOT NULL",
         (pair, tf_key, ts_str(ind_dev.index[-1]))).fetchall()
@@ -347,9 +351,13 @@ def verdicts_due(con, pair, tf_key, ind_dev, n_trials: int) -> bool:
 
 
 def save_verdicts(con, pair, tf_key, dev: pd.DataFrame, b, costs, pip, now, n_trials: int) -> None:
-    """フェーズ2の評価（初期設定）を開発用データだけで行い、戦略ごとの判定を保存する（相場の解説で使う）。"""
+    """フェーズ2の評価（初期設定）を開発用データだけで行い、戦略ごとの判定を保存する（相場の解説で使う）。
+    コストは時間帯によって広めに見積もる（要件定義書 5-2）。"""
+    s = user_settings.load()
+    mult = costmodel.spread_multipliers(dev.index, tf_key, s.costs, s.event_filter)
     rep = bt.evaluate_all(dev[["open", "high", "low", "close"]], P, RISK, exit_rules(tf_key), costs, pip,
-                          runs=VERDICT_RANDOM_RUNS, holdout_start=b.start, rw_paths=VERDICT_RW_PATHS)
+                          runs=VERDICT_RANDOM_RUNS, holdout_start=b.start, rw_paths=VERDICT_RW_PATHS, spread_mult=mult)
+    tracking.set_state(con, pair, tf_key, "verdict_cost_model", costmodel.COST_MODEL_VERSION)
     trials.record(con, rep.trials, pair=pair, tf=tf_key, origin="job", now=now,
                   data_from=dev.index[0], data_to=dev.index[-1], n_bars=len(dev))
     rep = bt.finalize(rep, n_trials)  # この処理で試す予定の分を含めた、すべての試行の数で DSR を割り引く

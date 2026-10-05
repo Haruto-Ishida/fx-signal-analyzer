@@ -60,7 +60,7 @@ class ExitRules:
 class Bars:
     """シミュレーション用に列を Python のリストにしたもの（ループを速くするため）。"""
 
-    def __init__(self, ind: pd.DataFrame):
+    def __init__(self, ind: pd.DataFrame, mult=None):
         self.index = ind.index
         self.n = len(ind)
         self.o = ind["open"].tolist()
@@ -68,6 +68,10 @@ class Bars:
         self.l = ind["low"].tolist()
         self.c = ind["close"].tolist()
         self.atr = ind["atr"].tolist()
+        # 足ごとのスプレッドの倍率（costmodel.spread_multipliers）。None なら一定のコスト
+        self.mult = None if mult is None else [float(x) for x in mult]
+        if self.mult is not None and len(self.mult) != self.n:
+            raise ValueError("スプレッドの倍率の数が足の数と合いません")
 
 
 TRADE_FIELDS = ["dir", "signal_i", "entry_i", "exit_i", "entry", "exit", "sl", "tp", "reason", "pips"]
@@ -81,6 +85,8 @@ def simulate_raw(
     end = bars.n if end is None else end
     o, h, l, c, atr = bars.o, bars.h, bars.l, bars.c, bars.atr
     cost = costs.round_trip
+    mult = bars.mult  # 時間帯によるスプレッドの倍率（なければ一定のコスト）
+    half, slip2 = costs.spread / 2, 2 * costs.slippage
     out = []
     k = start
     while k < end - 1:
@@ -109,7 +115,8 @@ def simulate_raw(
                 reason, px, exit_j, next_k = "期間末", c[j], j, end
                 break
             j += 1
-        out.append((d, k, e, exit_j, entry, px, sl, tp, reason, d * (px - entry) / pip - cost))
+        c_trade = cost if mult is None else half * (mult[e] + mult[exit_j]) + slip2  # 入る足と出る足のスプレッドの半分ずつ
+        out.append((d, k, e, exit_j, entry, px, sl, tp, reason, d * (px - entry) / pip - c_trade))
         k = next_k
     return out
 
@@ -209,14 +216,15 @@ def random_walk_ohlc(ohlc: pd.DataFrame, rng: np.random.Generator) -> pd.DataFra
 
 def random_walk_baseline(ohlc: pd.DataFrame, base: IndicatorParams, risk: RiskParams, rules: ExitRules,
                          costs: Costs, pip: float, paths: int = 50, seed: int = 0,
-                         strategy_list: list[Strategy] | None = None) -> pd.DataFrame:
-    """ランダムウォークの価格で各戦略（初期パラメータ）を動かした成績。行＝試行、列＝戦略の損益合計（pips）。"""
+                         strategy_list: list[Strategy] | None = None, mult=None) -> pd.DataFrame:
+    """ランダムウォークの価格で各戦略（初期パラメータ）を動かした成績。行＝試行、列＝戦略の損益合計（pips）。
+    時刻は本物と同じなので、時間帯によるスプレッドの倍率（mult）も同じものを使う。"""
     rng = np.random.default_rng(seed)
     sts = list(strategy_list) if strategy_list is not None else strategies.STRATEGIES
     rows = []
     for _ in range(paths):
         ind = indicators.add_all(random_walk_ohlc(ohlc, rng), base)
-        bars = Bars(ind)
+        bars = Bars(ind, mult)
         row = {}
         for st in sts:
             sig = strategies.signals(ind, st, base).tolist()
@@ -248,7 +256,7 @@ class Candidate:
 
 
 def candidates(raw: pd.DataFrame, strategy: Strategy, base: IndicatorParams,
-               cache: dict | None = None) -> list[Candidate]:
+               cache: dict | None = None, mult=None) -> list[Candidate]:
     cache = {} if cache is None else cache
     out = []
     for ov in strategy.grid():
@@ -256,7 +264,7 @@ def candidates(raw: pd.DataFrame, strategy: Strategy, base: IndicatorParams,
         if p not in cache:
             cache[p] = indicators.add_all(raw, p)
         ind = cache[p]
-        out.append(Candidate(ov, p, Bars(ind), strategies.signals(ind, strategy, p).tolist()))
+        out.append(Candidate(ov, p, Bars(ind, mult), strategies.signals(ind, strategy, p).tolist()))
     return out
 
 
@@ -297,10 +305,11 @@ class WalkForwardResult:
 def walk_forward(
     raw: pd.DataFrame, strategy: Strategy, base: IndicatorParams, risk: RiskParams, rules: ExitRules,
     costs: Costs, pip: float, k: int = 5, train_mult: int = 2, min_trades: int = 5, cache: dict | None = None,
+    mult=None,
 ) -> WalkForwardResult:
     """各学習区間で損益合計が最大のパラメータを選び（取引が min_trades 回未満の候補は除外）、
     直後の検証区間でそのまま使ったときの成績を測る。"""
-    cands = candidates(raw, strategy, base, cache)
+    cands = candidates(raw, strategy, base, cache, mult)
     folds = []
     for (a, b), (b2, c) in make_folds(len(raw), k, train_mult):
         best, best_m, best_score = cands[0], None, -math.inf
@@ -368,6 +377,7 @@ def evaluate_all(
     raw: pd.DataFrame, base: IndicatorParams, risk: RiskParams, rules: ExitRules, costs: Costs, pip: float,
     runs: int = 200, k: int = 5, train_mult: int = 2, holdout_start: pd.Timestamp | None = None,
     rw_paths: int = 50, n_trials: int | None = None, strategy_list: list[Strategy] | None = None,
+    spread_mult=None,
 ) -> Report:
     """raw は開発用データ（最終テスト期間より前）。holdout_start を渡すと、それ以降の足が混ざっていたら止める。
 
@@ -380,13 +390,13 @@ def evaluate_all(
     cache: dict = {}
     ind = indicators.add_all(raw, base)
     cache[base] = ind
-    bars = Bars(ind)
+    bars = Bars(ind, spread_mult)
     n = len(ind)
     days = overfit.business_days(ind.index[WARMUP], ind.index[-1])
     reports, rates, grid = [], [], {}
     sts = list(strategy_list) if strategy_list is not None else strategies.STRATEGIES
-    rw = (random_walk_baseline(raw, base, risk, rules, costs, pip, rw_paths, seed=7, strategy_list=sts)
-          if rw_paths else pd.DataFrame())
+    rw = (random_walk_baseline(raw, base, risk, rules, costs, pip, rw_paths, seed=7, strategy_list=sts,
+                               mult=spread_mult) if rw_paths else pd.DataFrame())
     for i, st in enumerate(sts):
         sig = strategies.signals(ind, st, base).tolist()
         full = simulate(bars, sig, risk, rules, costs, pip, WARMUP, n)
@@ -395,7 +405,7 @@ def evaluate_all(
         rates.append(rate)
         full_rand, _ = random_baseline(bars, [(WARMUP, n, rate)], risk, rules, costs, pip, runs, seed=i)
 
-        wf = walk_forward(raw, st, base, risk, rules, costs, pip, k, train_mult, cache=cache)
+        wf = walk_forward(raw, st, base, risk, rules, costs, pip, k, train_mult, cache=cache, mult=spread_mult)
         wf_windows = [(f.test[0], f.test[1], f.test_rate) for f in wf.folds]
         wf_rand, _ = random_baseline(bars, wf_windows, risk, rules, costs, pip, runs, seed=100 + i)
         wf_beat = beat_ratio(wf.test_metrics["total"], wf_rand["total"])
@@ -409,7 +419,7 @@ def evaluate_all(
         wf_daily = overfit.daily_pnl(exit_times(wt), wt["pips"], wf_days)
 
         # PBO 用：この戦略の全パラメータ候補を、開発用データ全体で動かした日ごとの損益
-        for cand in candidates(raw, st, base, cache):
+        for cand in candidates(raw, st, base, cache, spread_mult):
             t = simulate(cand.bars, cand.sig, risk, rules, costs, pip, WARMUP, n)
             grid[f"{st.key}|{describe_params(st.key, cand.overrides)}"] = overfit.daily_pnl(exit_times(t), t["pips"], days)
 

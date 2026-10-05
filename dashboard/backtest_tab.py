@@ -8,7 +8,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from fxtool import backtest as bt
-from fxtool import data, trials
+from fxtool import costmodel, data, trials
+from fxtool import settings as user_settings
 from fxtool.config import DEFAULT_SLIPPAGE, DEFAULT_SPREAD, IndicatorParams, RiskParams
 
 from .common import NEUTRAL_COLOR, STRATEGY_COLORS, Context, fmt_pct, fmt_pf, fmt_pips
@@ -19,10 +20,16 @@ VERDICT_ICONS = {"有望（要継続監視）": "🟢", "偶然の範囲": "🟡
 
 @st.cache_data(show_spinner=False, max_entries=6)
 def run(pair: str, tf_key: str, ohlc: pd.DataFrame, params: IndicatorParams, risk: RiskParams, rules: bt.ExitRules,
-        costs: bt.Costs, pip: float, runs: int, k: int, train_mult: int, holdout_start: pd.Timestamp) -> bt.Report:
+        costs: bt.Costs, pip: float, runs: int, k: int, train_mult: int, holdout_start: pd.Timestamp,
+        time_varying_costs: bool = True) -> bt.Report:
     """開発用データだけで評価し、試した組み合わせを記録してから、記録済みの試行すべての数で DSR を割り引く
-    （同じ設定はキャッシュされ、二重に記録しない）。"""
-    rep = bt.evaluate_all(ohlc, params, risk, rules, costs, pip, runs, k, train_mult, holdout_start=holdout_start)
+    （同じ設定はキャッシュされ、二重に記録しない）。time_varying_costs なら、時間帯によってスプレッドを広めに見積もる。"""
+    mult = None
+    if time_varying_costs:
+        s = user_settings.load()
+        mult = costmodel.spread_multipliers(ohlc.index, tf_key, s.costs, s.event_filter)
+    rep = bt.evaluate_all(ohlc, params, risk, rules, costs, pip, runs, k, train_mult, holdout_start=holdout_start,
+                          spread_mult=mult)
     con = data.connect()
     try:
         trials.record(con, rep.trials, pair=pair, tf=tf_key, origin="dashboard", now=data.now_utc(),
@@ -98,9 +105,17 @@ def render(ctx: Context) -> None:
         runs = d[0].selectbox("ランダム売買の試行回数", [100, 200, 500], index=1)
         k = d[1].slider("ウォークフォワードの区間数", 3, 8, 5)
         train_mult = d[2].slider("学習区間の長さ（検証区間の何倍か）", 1, 4, 2)
+        cs = user_settings.load().costs
+        tvc = st.checkbox(
+            "時間帯によってスプレッドを広めに見積もる", True, key="time_varying_costs",
+            help=f"重要な経済指標の前後（×{cs.event_spread_multiplier:g}）、週明け（×{cs.weekend_open_spread_multiplier:g}）、"
+                 f"ロールオーバーの時間帯（×{cs.rollover_spread_multiplier:g}）は、実際にスプレッドが広がりやすいので、"
+                 "その足で売買したときのスプレッドを倍率の分だけ大きくします（倍率は settings.toml で変更できます）。",
+        )
         st.caption(
             f"損切り ATR×{ctx.risk.sl_atr:g}・利確 ATR×{ctx.risk.tp_atr:g} は左の設定と共通です。"
-            f"1回の取引のコスト：{spread + 2 * slip:.1f} pips（スプレッド + スリッページ×2）。スワップポイントは含みません。"
+            f"1回の取引のコスト：ふだんは {spread + 2 * slip:.1f} pips（スプレッド + スリッページ×2）"
+            + ("、広がりやすい時間帯はスプレッドを倍率の分だけ大きく見積もります" if tvc else "") + "。スワップポイントは含みません。"
         )
 
     holdout_notice(ctx)
@@ -117,7 +132,7 @@ def render(ctx: Context) -> None:
     costs = bt.Costs(spread, slip)
     with st.spinner("バックテスト中…（初回は10秒前後かかります）"):
         rep = run(ctx.pair, ctx.tf_key, conf[["open", "high", "low", "close"]], ctx.params, ctx.risk, rules, costs,
-                  ctx.pip, runs, k, train_mult, ctx.boundary.start)
+                  ctx.pip, runs, k, train_mult, ctx.boundary.start, tvc)
 
     n = len(conf)
     t_disp = ctx.to_display_time(conf.index)

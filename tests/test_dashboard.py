@@ -112,7 +112,7 @@ def test_backtest_and_ml_tabs_use_dev_data_only(db, ctx, monkeypatch):
     seen = {}
 
     def fake_bt(*args, **kw):
-        seen["bt"] = (args[2].index[-1], args[-1])  # 3番目が開発用データ、最後が最終テスト期間の始まり
+        seen["bt"] = (args[2].index[-1], args[11])  # 3番目が開発用データ、12番目が最終テスト期間の始まり
         raise RuntimeError("stop")
 
     def fake_ml(pair, tf_key, ohlc, *args, **kw):
