@@ -6,3 +6,6 @@ __pycache__/
 
 # 取得データ・学習済みモデル・ログ（いつでも作り直せる。サイズも大きい）
 data/
+
+# 秘密情報（Discord の Webhook URL など）。絶対に git に入れない。見本は .env.example
+.env

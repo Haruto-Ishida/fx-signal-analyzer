@@ -5,7 +5,7 @@ import streamlit as st
 
 from dashboard import backtest_tab, famous_tab, ga_tab, ml_tab, paper_tab, papers_tab, signals_tab, tracking_tab
 from dashboard.common import JST, Context
-from fxtool import data, events, indicators, jobs, killswitch, tracking, trials
+from fxtool import data, events, indicators, jobs, killswitch, notify, tracking, trials
 from fxtool import settings as user_settings
 from fxtool.config import (
     DAILY_MAX_LOSS_R, DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, PAIR_NAMES, PAIRS, TIMEFRAMES, WEEKLY_MAX_LOSS_R,
@@ -133,6 +133,11 @@ with st.sidebar:
         f"🧮 **試した組み合わせ（累計）**：{n_trials_total:,} 通り",
         help="これまでに検証した戦略・パラメータ・モデルの設定の数です。たくさん試すほど、偶然よく見えるものが"
              "見つかりやすくなるので、成績はこの数で割り引いて評価します（DSR）。",
+    )
+    st.caption(
+        f"🔔 **Discord への通知**：{'有効' if notify.load_config().ready else '停止中'}",
+        help="`.env` の NOTIFY_ENABLED と DISCORD_WEBHOOK_URL で設定します（見本は `.env.example`）。"
+             "送るのはシグナルと動作状況だけで、残高・数量・損失額などの口座の情報は送りません。",
     )
     q = data.quality(raw, tf)
     with st.expander("💾 データについて"):
