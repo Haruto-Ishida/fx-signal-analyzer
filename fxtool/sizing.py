@@ -29,16 +29,32 @@ def quote_to_jpy(ticker: str, usdjpy: float | None) -> float | None:
 
 
 def position_size(balance_jpy: float, risk_pct: float, entry: float, sl: float, ticker: str,
-                  usdjpy: float | None) -> Size | None:
-    """損切りまでの値幅 × 数量 × 円換算 ≤ 残高 × 許容損失% になる最大の数量。"""
+                  usdjpy: float | None, max_leverage: float | None = None, open_notional_jpy: float = 0.0) -> Size | None:
+    """損切りまでの値幅 × 数量 × 円換算 ≤ 残高 × 許容損失% になる最大の数量。
+
+    max_leverage を渡すと、（すでに持っているポジションの合計 ＋ 今回の数量）× 価格 ≤ 残高 × max_leverage にも抑える
+    （実効レバレッジの上限。要件定義書 7章）。"""
     conv = quote_to_jpy(ticker, usdjpy)
     stop = abs(entry - sl)
     if conv is None or not stop or math.isnan(stop):
         return None
     risk_jpy = balance_jpy * risk_pct / 100
     raw_units = risk_jpy / (stop * conv)
+    note = ""
+    if max_leverage is not None:
+        room = max(balance_jpy * max_leverage - open_notional_jpy, 0.0)
+        cap = room / (entry * conv)
+        if cap < raw_units:
+            raw_units = cap
+            note = f"実効レバレッジの上限（{max_leverage:g}倍）で数量を抑えています"
     units = int(raw_units // MIN_UNITS * MIN_UNITS)
     if units == 0:
         return Size(0, risk_jpy, MIN_UNITS * stop * conv,
-                    f"最小単位（{MIN_UNITS:,}通貨）でも許容損失を超えます")
-    return Size(units, risk_jpy, units * stop * conv)
+                    note or f"最小単位（{MIN_UNITS:,}通貨）でも許容損失を超えます")
+    return Size(units, risk_jpy, units * stop * conv, note)
+
+
+def notional_jpy(units: float, price: float, ticker: str, usdjpy: float | None) -> float:
+    """ポジションの大きさ（円）。実効レバレッジ ＝ ポジションの合計 ÷ 残高。"""
+    conv = quote_to_jpy(ticker, usdjpy)
+    return float("nan") if conv is None else units * price * conv

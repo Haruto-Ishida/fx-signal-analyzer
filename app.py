@@ -6,6 +6,7 @@ import streamlit as st
 from dashboard import backtest_tab, ml_tab, signals_tab, tracking_tab
 from dashboard.common import JST, Context
 from fxtool import data, events, indicators, jobs, tracking, trials
+from fxtool import settings as user_settings
 from fxtool.config import (
     DAILY_MAX_LOSS_R, DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, PAIR_NAMES, PAIRS, TIMEFRAMES, WEEKLY_MAX_LOSS_R,
     IndicatorParams, RiskParams, pip_size, price_digits,
@@ -31,10 +32,18 @@ with st.sidebar:
         ),
     )
     st.subheader("数量の目安")
-    balance = st.number_input("口座残高（円）", 10_000, 1_000_000_000, DEFAULT_BALANCE_JPY, step=100_000)
-    risk_pct = st.number_input(
-        "1回の許容損失（残高の%）", 0.1, 2.0, DEFAULT_RISK_PCT, step=0.1,
-        help="損切りになったときの損失が、残高のこの割合に収まる数量を表示します（研究ノートの目安は1〜2%以内）。",
+    user_cfg = user_settings.load()
+    sz = user_cfg.sizing
+    balance = st.number_input(
+        "口座残高（円）", 1_000, 1_000_000_000, int(user_cfg.paper.initial_balance), step=10_000,
+        help="数量の目安の計算に使う残高です。初期値はペーパートレードの初期残高（settings.toml の [paper]）です。",
+    )
+    risk_pct = sz.fixed_risk_pct
+    st.caption(
+        f"1回の損失の目安：検証の取引が100回以上の戦略は **{sz.kelly_fraction:g}倍ケリー**（上限 {sz.max_risk_pct:g}%）、"
+        f"それ以外は **{sz.fixed_risk_pct:g}%**。実効レバレッジは **{sz.max_leverage:g}倍まで**。",
+        help="ケリー基準：勝率と「平均利益 ÷ 平均損失」から計算する、資産の増え方が理論上いちばん大きくなる賭け金の割合。"
+             "見積もりの誤差に弱いので、その一部（初期値は4分の1）だけを使います。数値は settings.toml で変更できます。",
     )
     force = st.button("今すぐデータを更新", width="stretch")
 
@@ -70,6 +79,8 @@ closed = signal_log[signal_log["status"].isin(tracking.DONE)]
 halt = tracking.loss_halt(closed, data.now_utc(), jobs.RISK.sl_atr, pip_size(ticker), DAILY_MAX_LOSS_R,
                           WEEKLY_MAX_LOSS_R)
 
+for w in user_cfg.warnings:
+    st.warning(f"⚙️ 設定ファイル：{w}")
 if cyc.data_error:
     st.warning(f"データの更新に失敗したため、保存済みのデータで表示しています。（{cyc.data_error}）")
 if cyc.error:
@@ -93,7 +104,7 @@ if n_conf < P.sma_long + P.atr_period:
 
 ctx = Context(pair, ticker, tf_key, tf, pip_size(ticker), price_digits(ticker), P, risk, ind, n_conf, weights,
               [], active_alerts, verdicts, boundary, float(balance), float(risk_pct), usdjpy,
-              signal_log=signal_log, meta_model=meta_model, halt=halt)
+              signal_log=signal_log, meta_model=meta_model, halt=halt, settings=user_cfg)
 
 with st.sidebar:
     st.divider()

@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from fxtool import backtest as bt
-from fxtool import costmodel, data, trials
+from fxtool import account, costmodel, data, money, trials
 from fxtool import settings as user_settings
 from fxtool.config import DEFAULT_SLIPPAGE, DEFAULT_SPREAD, IndicatorParams, RiskParams
 
@@ -240,6 +240,7 @@ def render(ctx: Context) -> None:
 
     render_yearly(ctx, rep, conf)
     render_overfit(rep)
+    render_money(ctx, rep, conf)
 
     keys = [r.strategy.key for r in rep.reports]
     by_key = {r.strategy.key: r for r in rep.reports}
@@ -293,6 +294,62 @@ def render(ctx: Context) -> None:
             "足の中の細かい値動きはわからないため、損切り・利確はちょうどその価格で約定したと仮定しています（急変時のずれは考慮していません）。\n"
             "- **最終テスト期間は使っていません。** ここで良い成績でも、最終的な実力は本番の記録で確かめます。"
         )
+
+
+def render_money(ctx: Context, rep: bt.Report, conf: pd.DataFrame) -> None:
+    """⑤ 資金管理（分数ケリー）と積立のシミュレーション（要件定義書 5-6・7章）。"""
+    st.markdown("### ⑤ 資金管理と積立のシミュレーション（ウォークフォワードの検証区間）")
+    s = ctx.settings
+    by_key = {r.strategy.key: r for r in rep.reports}
+    c = st.columns(3)
+    key = c[0].selectbox("戦略", list(by_key), format_func=lambda k: by_key[k].strategy.name, key="money_strategy")
+    initial = c[1].number_input("初期残高（円）", 1_000, 1_000_000_000, int(s.paper.initial_balance), 10_000,
+                                key="money_initial")
+    deposit = c[2].number_input("毎月の追加入金（円）", 0, 10_000_000, int(s.paper.monthly_deposit), 10_000,
+                                key="money_deposit", help="積立のシミュレーション。運用成績（時間加重リターン）からは入金の影響を除きます。")
+    r = by_key[key]
+    m = r.wf.test_metrics
+    dec = money.decide_risk(m["n"], m["win_rate"], m["payoff"], s.sizing)
+    if not r.verdict[0].startswith("有望"):
+        st.warning(f"この戦略の判定は「{VERDICT_ICONS[r.verdict[0]]} {r.verdict[0]}」です。下のシミュレーションの成績は、"
+                   "優位性が確認されていない戦略を、もし使っていたらという仮の計算です。将来も同じ成績になるとは考えないでください。")
+    st.markdown(f"**1回の損失の目安：{dec.risk_pct:.2g}%**（{dec.explanation}）")
+    t = r.wf.test_trades
+    if t.empty or dec.risk_pct <= 0:
+        st.info("この戦略では、シミュレーションする取引がありません（または、取引しない目安です）。")
+        return
+    trades = pd.DataFrame({
+        "entry_time": conf.index[t["entry_i"].to_numpy(dtype=int)], "exit_time": conf.index[t["exit_i"].to_numpy(dtype=int)],
+        "dir": t["dir"], "entry": t["entry"], "sl": t["sl"], "pips": t["pips"],
+    })
+    try:
+        res = account.simulate(trades, ctx.ticker, ctx.pip, dec.risk_pct, initial, deposit, s.sizing.max_leverage,
+                               ctx.usdjpy)
+    except ValueError as e:
+        st.warning(str(e))
+        return
+    mm = res.metrics
+    k = st.columns(4)
+    k[0].metric("運用成績（時間加重リターン）", f"{mm['twr']:+.1%}", f"年率 {mm['twr_annual']:+.1%}",
+                help="入金の影響を除いた、運用だけの増え方。戦略の評価・比較にはこちらを使います。")
+    k[1].metric("シャープレシオ（年率）", fmt_ratio(mm["sharpe"]))
+    k[2].metric("最大ドローダウン", f"{mm['max_dd']:.1%}", help="運用成績のピークからの最大の落ち込み。")
+    k[3].metric("最終残高", f"{mm['final']:,.0f}円", f"運用による増減 {mm['profit']:+,.0f}円（入金 {mm['deposits']:,.0f}円）")
+    d = res.daily
+    fig = go.Figure()
+    x = d.index
+    fig.add_trace(go.Scatter(x=x, y=initial + d["deposits_cum"], name="初期残高＋入金の累計", stackgroup=None,
+                             line=dict(color=NEUTRAL_COLOR, width=1.5, dash="dash")))
+    fig.add_trace(go.Scatter(x=x, y=d["balance"], name="残高（運用による増減を含む）", line=dict(color="#2962ff", width=2)))
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="円",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+    st.plotly_chart(fig, width="stretch")
+    st.caption(
+        f"ウォークフォワードの検証区間の取引（{mm['n']}回、見送り {mm['n_skipped']}回）を、仮想の口座で売買したとみなした結果です"
+        f"（数量は1回の損失 {dec.risk_pct:.2g}%、実効レバレッジ {s.sizing.max_leverage:g}倍まで、{1000:,}通貨単位）。"
+        "青い線が点線より上なら、運用で増えた分です。入金で残高が増えても、運用成績（時間加重リターン）は変わりません。"
+        + ("**途中で残高がなくなりました。**" if mm["bankrupt"] else "")
+    )
 
 
 def render_yearly(ctx: Context, rep: bt.Report, conf: pd.DataFrame) -> None:

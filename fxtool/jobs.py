@@ -363,11 +363,13 @@ def save_verdicts(con, pair, tf_key, dev: pd.DataFrame, b, costs, pip, now, n_tr
     rep = bt.finalize(rep, n_trials)  # この処理で試す予定の分を含めた、すべての試行の数で DSR を割り引く
     con.executemany(
         """INSERT OR REPLACE INTO backtest_verdicts
-           (pair, tf, source, computed_at, bar_time, verdict, reason, wf_total, wf_beat, dsr, pbo, n_trials, wf_n)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (pair, tf, source, computed_at, bar_time, verdict, reason, wf_total, wf_beat, dsr, pbo, n_trials, wf_n,
+            wf_win_rate, wf_payoff)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [(pair, tf_key, r.strategy.key, ts_str(now), ts_str(dev.index[-1]), r.verdict[0], r.verdict[1],
           r.wf.test_metrics["total"], r.wf_beat, _num(r.dsr.get("dsr")), _num(r.pbo.get("pbo")), rep.n_trials,
-          r.wf.test_metrics["n"]) for r in rep.reports],
+          r.wf.test_metrics["n"], _num(r.wf.test_metrics["win_rate"]), _num(r.wf.test_metrics["payoff"]))
+         for r in rep.reports],
     )
 
 

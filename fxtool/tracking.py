@@ -125,7 +125,8 @@ def migrate(con: sqlite3.Connection) -> None:
         if c not in reg_cols:
             con.execute(f"ALTER TABLE model_registry ADD COLUMN {c} TEXT")
     ver_cols = _columns(con, "backtest_verdicts")
-    for c, typ in (("dsr", "REAL"), ("pbo", "REAL"), ("n_trials", "INTEGER"), ("wf_n", "INTEGER")):
+    for c, typ in (("dsr", "REAL"), ("pbo", "REAL"), ("n_trials", "INTEGER"), ("wf_n", "INTEGER"),
+                   ("wf_win_rate", "REAL"), ("wf_payoff", "REAL")):
         if c not in ver_cols:
             con.execute(f"ALTER TABLE backtest_verdicts ADD COLUMN {c} {typ}")
     # フェーズ4改修：メタラベリングの判定・最大損失による停止を記録に残す
@@ -472,7 +473,7 @@ def load_weight_history(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataF
 def load_verdicts(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
     df = pd.read_sql_query("SELECT * FROM backtest_verdicts WHERE pair=? AND tf=?", con, params=(pair, tf),
                            parse_dates=["computed_at", "bar_time"])
-    return _numeric(df, ["wf_total", "wf_beat", "dsr", "pbo", "n_trials", "wf_n"])
+    return _numeric(df, ["wf_total", "wf_beat", "dsr", "pbo", "n_trials", "wf_n", "wf_win_rate", "wf_payoff"])
 
 
 @dataclass

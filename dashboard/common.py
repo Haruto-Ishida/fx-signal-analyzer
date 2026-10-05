@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from fxtool import holdout
+from fxtool.settings import Settings
 from fxtool.config import (
     DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, VERTICAL_BARRIER, IndicatorParams, RiskParams, Timeframe,
 )
@@ -39,6 +40,7 @@ class Context:
     signal_log: pd.DataFrame = field(default_factory=pd.DataFrame)  # 本番の記録（フェーズ4）
     meta_model: dict | None = None                           # 本番の機械学習（メタラベリング）の最新モデル
     halt: object = None                                      # 最大損失による停止の状態（tracking.Halt）
+    settings: Settings = field(default_factory=Settings)     # settings.toml の値
 
     def meta_for(self, source: str, signal_time: pd.Timestamp) -> tuple[float, str] | None:
         """そのシグナルについて、本番の機械学習が記録した（確率, 乗る/見送り）。まだなければ None。"""

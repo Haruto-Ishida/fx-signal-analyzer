@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from fxtool import commentary, data, events, sizing, strategies, tracking
+from fxtool import commentary, data, events, money, sizing, strategies, tracking
 from fxtool.config import LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, MIN_UNITS
 
 from .common import BUY_COLOR, NEUTRAL_COLOR, SELL_COLOR, Context, color_decision
@@ -84,15 +84,30 @@ def render(ctx: Context) -> None:
         name = "時間切れ" if o.status == "期限" else o.status
         return f"{name}に到達 {ctx.label(o.exit_time)}（{pips:+.1f} pips）"
 
+    vrows = {r["source"]: r for r in ctx.verdicts.to_dict("records")} if not ctx.verdicts.empty else {}
+
+    def risk_for(key: str) -> money.RiskDecision:
+        """その戦略の検証区間の成績（最終テスト期間は含まない）から、1回の損失の目安を決める。"""
+        r = vrows.get(key, {})
+        n = r.get("wf_n")
+        return money.decide_risk(0 if n is None or pd.isna(n) else int(n),
+                                 float(r.get("wf_win_rate", float("nan"))), float(r.get("wf_payoff", float("nan"))),
+                                 ctx.settings.sizing)
+
     def size_text(v: strategies.StrategyView) -> str:
         if v.decision not in ("買い", "売り"):
             return "—"
-        s = sizing.position_size(ctx.balance_jpy, ctx.risk_pct, v.entry, v.sl, ctx.ticker, ctx.usdjpy)
+        dec = risk_for(v.strategy.key)
+        if dec.risk_pct <= 0:
+            return "取引しない目安（検証の期待値がマイナス）"
+        s = sizing.position_size(ctx.balance_jpy, dec.risk_pct, v.entry, v.sl, ctx.ticker, ctx.usdjpy,
+                                 max_leverage=ctx.settings.sizing.max_leverage)
         if s is None:
             return "円換算できません"
         if s.units == 0:
             return s.note
-        return f"{s.units:,}通貨（損切り時 −{s.loss_at_stop_jpy:,.0f}円）"
+        how = "ケリー" if dec.method == "kelly" else "固定"
+        return f"{s.units:,}通貨（損切り時 −{s.loss_at_stop_jpy:,.0f}円・{how} {dec.risk_pct:.2g}%）"
 
     meta_ok = bool(ctx.meta_model and ctx.meta_model.get("ok"))
 
@@ -128,7 +143,9 @@ def render(ctx: Context) -> None:
         f"{ctx.max_bars}本で決着しなければ時間切れ。シグナルから {risk.valid_bars} 本以内で、"
         "まだ決着していないものを「買い／売り」、それ以外を「様子見」としています。"
         "1本の足の中で損切りと利確の両方に届いた場合は、損切りが先とみなしています。"
-        f"数量の目安は、損切りになったときの損失が口座残高 {ctx.balance_jpy:,.0f}円 の {ctx.risk_pct:g}% 以内に収まる数量です"
+        f"数量の目安は、口座残高 {ctx.balance_jpy:,.0f}円 に対して、検証の取引が100回以上の戦略は"
+        f"{ctx.settings.sizing.kelly_fraction:g}倍ケリー（上限 {ctx.settings.sizing.max_risk_pct:g}%）、それ以外は"
+        f"{ctx.settings.sizing.fixed_risk_pct:g}% の損失に収まり、実効レバレッジ {ctx.settings.sizing.max_leverage:g}倍以内の数量です"
         f"（{MIN_UNITS:,}通貨単位で切り捨て。注文はしません）。"
         "「機械学習（乗る/見送り）」は、本番のメタラベリングのモデルが、そのシグナルにコスト後に利益が出る確率を予測した結果です"
         + ("。" if meta_ok else "（開発用データの検証で条件を満たしていないため「参考」。売買の判断には使わないでください）。")
