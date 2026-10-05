@@ -21,6 +21,10 @@ def test_daily_pnl_and_sharpe():
                           [10, -4, 6], days)
     assert d.tolist() == [6, 0, 0, 6, 0]
     x = np.array([1.0, 2.0, 3.0, 4.0])
+    # 日曜 23 時（UTC）の週明けの足で決済した損益は、月曜に計上されて消えない
+    days2 = overfit.business_days(pd.Timestamp("2026-10-02"), pd.Timestamp("2026-10-06"))  # 金・月・火
+    d2 = overfit.daily_pnl(pd.to_datetime(["2026-10-04 23:00", "2026-10-03 01:00", "2026-10-05 10:00"]), [5, 2, 1], days2)
+    assert d2.tolist() == [0, 8, 0] and d2.sum() == 8
     assert overfit.sharpe(x) == pytest.approx(x.mean() / x.std(ddof=1))
     assert overfit.sharpe(np.zeros(5)) == 0
     assert overfit.annualized(0.1) == pytest.approx(0.1 * math.sqrt(252))

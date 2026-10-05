@@ -26,9 +26,19 @@ def business_days(start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
 
 
 def daily_pnl(exit_times, pips, days: pd.DatetimeIndex) -> pd.Series:
-    """決済した日に損益を計上した、平日ごとの損益（pips）。取引のない日は 0。"""
-    s = pd.Series(np.asarray(pips, dtype=float), index=pd.DatetimeIndex(exit_times).normalize())
-    return s.groupby(level=0).sum().reindex(days, fill_value=0.0)
+    """決済した日に損益を計上した、平日ごとの損益（pips）。取引のない日は 0。
+
+    週明けの足（UTC の日曜 23 時）などで土日に決済した損益は、次の月曜に計上する（平日だけの列から漏れないように）。
+    """
+    d = pd.DatetimeIndex(exit_times).normalize()
+    dow = d.dayofweek.to_numpy()
+    d = d + pd.to_timedelta(np.select([dow == 5, dow == 6], [2, 1], 0), unit="D")
+    s = pd.Series(np.asarray(pips, dtype=float), index=d)
+    out = s.groupby(level=0).sum()
+    missing = out.index.difference(days)
+    if len(missing):
+        raise ValueError(f"日ごとの損益の期間の外で決済した取引があります: {list(missing[:3])}")
+    return out.reindex(days, fill_value=0.0)
 
 
 def sharpe(daily: pd.Series | np.ndarray) -> float:
