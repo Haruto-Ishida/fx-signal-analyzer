@@ -113,7 +113,7 @@ def build(
         if meta_skip:
             headline += f"機械学習は{'・'.join(v.strategy.name for v in meta_skip)}のシグナルを「見送り」と判定しています。"
     if halted:
-        headline = "⛔ 停止中：最大損失に達したため、新しいシグナルは出していません。" + headline
+        headline = "⛔ 停止中：新しいシグナルは出していません（理由は注意点を参照）。" + headline
 
     # ---------------- なぜこのシグナルか ----------------
     reasons = []

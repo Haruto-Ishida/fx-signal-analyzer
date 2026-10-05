@@ -30,11 +30,15 @@ class AccountResult:
 
 def simulate(trades: pd.DataFrame, ticker: str, pip: float, risk_pct: float, initial: float,
              monthly_deposit: float = 0.0, max_leverage: float | None = 5.0, usdjpy: float | None = None) -> AccountResult:
-    """trades の列：entry_time, exit_time, dir, entry, sl, pips（コスト後）。時刻は UTC。"""
-    conv = sizing.quote_to_jpy(ticker, usdjpy)
-    if conv is None:
-        raise ValueError(f"{ticker} の損益を円に換算できません（USD/JPY のレートが必要です）")
+    """trades の列：entry_time, exit_time, dir, entry, sl, pips（コスト後）。時刻は UTC。
+    複数の通貨ペアをまとめるときは、trades に ticker・pip の列を入れる（その行の値を使う）。"""
     t = trades.sort_values("entry_time", kind="stable").reset_index(drop=True)
+    tickers = t["ticker"].tolist() if "ticker" in t.columns else [ticker] * len(t)
+    pips_ = t["pip"].to_numpy(dtype=float) if "pip" in t.columns else np.full(len(t), pip)
+    for tk in dict.fromkeys(tickers or [ticker]):
+        if sizing.quote_to_jpy(tk, usdjpy) is None:
+            raise ValueError(f"{tk} の損益を円に換算できません（USD/JPY のレートが必要です）")
+    convs = np.array([sizing.quote_to_jpy(tk, usdjpy) for tk in tickers], dtype=float)
     if t.empty:
         return AccountResult(t, pd.DataFrame(), _empty_metrics(initial))
 
@@ -64,17 +68,17 @@ def simulate(trades: pd.DataFrame, ticker: str, pip: float, risk_pct: float, ini
                 note[i] = "残高がなくなったため見送り"
                 continue
             row = t.iloc[i]
-            sz = sizing.position_size(balance, risk_pct, row.entry, row.sl, ticker, usdjpy, max_leverage,
+            sz = sizing.position_size(balance, risk_pct, row.entry, row.sl, tickers[i], usdjpy, max_leverage,
                                       sum(open_notional.values()))
             if sz is None or sz.units == 0:
                 note[i] = "見送り：" + (sz.note if sz else "数量を計算できない")
                 continue
             units[i], risk_jpy[i], note[i] = sz.units, sz.loss_at_stop_jpy, sz.note
-            open_notional[i] = sizing.notional_jpy(sz.units, row.entry, ticker, usdjpy)
+            open_notional[i] = sizing.notional_jpy(sz.units, row.entry, tickers[i], usdjpy)
         else:  # exit
             if units[i] == 0:
                 continue
-            pnl[i] = units[i] * t["pips"].iat[i] * pip * conv
+            pnl[i] = units[i] * t["pips"].iat[i] * pips_[i] * convs[i]
             balance += pnl[i]
             open_notional.pop(i, None)
             if balance <= 0:

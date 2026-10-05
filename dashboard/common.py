@@ -39,8 +39,10 @@ class Context:
     usdjpy: float | None = None                              # 円以外の通貨の損失を円に直すため
     signal_log: pd.DataFrame = field(default_factory=pd.DataFrame)  # 本番の記録（フェーズ4）
     meta_model: dict | None = None                           # 本番の機械学習（メタラベリング）の最新モデル
-    halt: object = None                                      # 最大損失による停止の状態（tracking.Halt）
+    halt: object = None                                      # 停止の状態（最大損失・キルスイッチ・経済指標をまとめた tracking.Halt）
     settings: Settings = field(default_factory=Settings)     # settings.toml の値
+    paper: object = None                                     # ペーパー口座（account.AccountResult）
+    kill: object = None                                      # キルスイッチの状態（killswitch.KillState）
 
     def meta_for(self, source: str, signal_time: pd.Timestamp) -> tuple[float, str] | None:
         """そのシグナルについて、本番の機械学習が記録した（確率, 乗る/見送り）。まだなければ None。"""

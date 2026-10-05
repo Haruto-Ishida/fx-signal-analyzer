@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from . import backtest as bt
-from . import costmodel, data, holdout, indicators, ml, ml_eval, strategies, tracking, trials
+from . import costmodel, data, events, holdout, indicators, killswitch, ml, ml_eval, strategies, tracking, trials
 from . import settings as user_settings
 from .config import (
     DAILY_MAX_LOSS_R, DEFAULT_SLIPPAGE, DEFAULT_SPREAD, LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, ML_META_FOLDS,
@@ -71,7 +71,7 @@ class CycleResult:
         if self.verdicts_updated:
             parts.append("戦略の検証結果を更新")
         if self.halted:
-            parts.append("最大損失のため新しいシグナルを停止中")
+            parts.append("最大損失・キルスイッチのため新しいシグナルを停止中")
         if self.new_alerts:
             parts.append(f"新しい警告{self.new_alerts}件")
         if self.data_error:
@@ -145,10 +145,18 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
           r.pf if math.isfinite(r.pf) else None, r.z) for r in live],
     )
     halt = tracking.loss_halt(closed, now, RISK.sl_atr, pip, DAILY_MAX_LOSS_R, WEEKLY_MAX_LOSS_R)
-    res.halted = halt.reason if halt.active else ""
+    # キルスイッチ（ペーパー口座全体の記録から。要件定義書 8章）
+    s = user_settings.load()
+    _, kill = killswitch.check(con, now, s, data.latest_close(con, "USD/JPY"))
+    # 1日の回数は、シグナルごとにその日の回数で判断する（まとめて記録するときに、別の日の分まで止めないように）
+    stop_reasons = [x for x in (halt.reason if halt.active else "",
+                                " ／ ".join(t.reason for t in kill.trips if t.kind != "frequency")) if x]
+    res.halted = " ／ ".join([*stop_reasons, *(t.reason for t in kill.trips if t.kind == "frequency")])
 
     res.signals_logged = log_strategy_signals(con, pair, tf_key, ind, {r.source: r.weight for r in live}, now,
-                                              suppressed=halt.active)
+                                              suppressed=bool(stop_reasons), reason=" ／ ".join(stop_reasons),
+                                              max_per_day=s.kill_switch.max_signals_per_day,
+                                              event_filter=s.event_filter)
     fill_entries(con, pair, tf_key, raw)
 
     # この処理で試す予定の設定も含めた「試した数」。戦略の判定と機械学習の条件を、同じ数で割り引く
@@ -182,41 +190,71 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
     conds += tracking.data_condition(ind.index[-1], now, tf.bar, settings.stale_bars)
     if halt.active:
         conds.append(tracking.Condition("risk", "max_loss", "critical", halt.reason))
+    for t in kill.trips:
+        conds.append(tracking.Condition("risk", f"kill_{t.kind}", "critical", "キルスイッチ：" + t.reason))
     res.new_alerts = tracking.sync_alerts(con, pair, tf_key, conds, now)
     con.commit()
 
 
 # ---------------- シグナルの記録 ----------------
 
-def log_strategy_signals(con, pair, tf_key, ind, weights, now, suppressed: bool = False) -> int:
+def log_strategy_signals(con, pair, tf_key, ind, weights, now, suppressed: bool = False, reason: str = "",
+                         max_per_day: int | None = None, event_filter=None) -> int:
     """前回処理した足より後に確定した足のシグナルを記録する。初回は最新の確定足の分だけ。
     エントリーは次の足の始値なので、ここでは「待機」として記録し、fill_entries で埋める。
-    最大損失で停止中なら suppressed=1 を付けて記録する（停止のルールの効果を後で確かめられるように）。"""
+    次のときは suppressed=1 と理由を付けて記録だけする（停止のルールの効果を後で確かめられるように）：
+    - suppressed=True（最大損失・キルスイッチで停止中。理由は reason）
+    - シグナルが出た時刻（足が確定した時刻）が重要な経済指標の前後（event_filter を渡したとき）
+    - そのシグナルの日（日本時間）に、口座全体でもう max_per_day 回シグナルを出していた（キルスイッチの「1日の回数」。
+      その日の停止を手動で解除していれば止めない）"""
+    from . import paper
+    used: dict[pd.Timestamp, int] = {}
+    released_days: set[str] = set()
+    if max_per_day is not None:
+        el = paper.eligible(con)
+        used = ((el["signal_time"] + tracking.JST).dt.normalize()).value_counts().to_dict() if len(el) else {}
+        released_days = {k.split(":", 1)[1] for k in killswitch.released_keys(con) if k.startswith("frequency:")}
     n = len(ind)
     last = tracking.get_state(con, pair, tf_key, "strategy_last_bar")
     start = n - 1 if last is None else int(ind.index.searchsorted(pd.Timestamp(last), side="right"))
     max_bars = TRACKING[tf_key].log_max_bars
-    rows = []
+    bar = TIMEFRAMES[tf_key].bar
+    found = []
     atr = ind["atr"].to_numpy()
     for s in strategies.STRATEGIES:
         sig = strategies.signals(ind, s, P).to_numpy()
         for i in range(start, n):
             if sig[i]:
-                rows.append((pair, tf_key, s.key, ts_str(ind.index[i]), int(sig[i]), float(atr[i]), max_bars,
-                             None, weights.get(s.key), ts_str(now), int(suppressed)))
+                found.append((i, s.key, int(sig[i])))
+    rows = []
+    for i, key, d in sorted(found):
+        why = reason if suppressed else ""
+        if not why and event_filter is not None:
+            e = events.blackout(PAIRS[pair], ind.index[i] + bar, event_filter)
+            if e is not None:
+                why = f"経済指標の前後（{e.name}・日本時間 {e.jst_label()}）"
+        if not why and max_per_day is not None:
+            day = (ind.index[i] + tracking.JST).normalize()
+            if used.get(day, 0) >= max_per_day and f"{day:%Y-%m-%d}" not in released_days:
+                why = f"1日のシグナルの回数の上限（{max_per_day}回。キルスイッチ）"
+            else:
+                used[day] = used.get(day, 0) + 1
+        rows.append((pair, tf_key, key, ts_str(ind.index[i]), d, float(atr[i]), max_bars,
+                     None, weights.get(key), ts_str(now), int(bool(why)), why or None))
     added = _insert_signals(con, rows)
     tracking.set_state(con, pair, tf_key, "strategy_last_bar", ts_str(ind.index[-1]))
     return added
 
 
 def _insert_signals(con, rows) -> int:
-    """rows：(pair, tf, source, signal_time, direction, atr, max_bars, prob, weight, logged_at, suppressed)。"""
+    """rows：(pair, tf, source, signal_time, direction, atr, max_bars, prob, weight, logged_at, suppressed[, 理由])。"""
+    rows = [r if len(r) == 12 else (*r, None) for r in rows]
     before = con.total_changes
     con.executemany(
         """INSERT OR IGNORE INTO signal_log
            (pair, tf, source, signal_time, direction, atr, max_bars, prob, weight, logged_at, suppressed,
-            status, entry_basis)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '待機', 'next_open')""", rows,
+            suppress_reason, status, entry_basis)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '待機', 'next_open')""", rows,
     )
     return con.total_changes - before
 

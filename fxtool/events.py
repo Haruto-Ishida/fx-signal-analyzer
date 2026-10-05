@@ -157,6 +157,29 @@ def upcoming(ticker: str, now: pd.Timestamp, hours: float = 48, schedule: pd.Dat
     return sorted(evs, key=lambda e: e.time)
 
 
+def blackout(ticker: str, t: pd.Timestamp, ef=None, schedule: pd.DataFrame | None = None) -> Event | None:
+    """経済指標フィルター（要件定義書 8章の2）：時刻 t（UTC）が、その通貨ペアに関係する重要な予定の
+    前後（settings.toml の [event_filter]。時刻が決まっていない日銀会合は前後 unfixed_window_minutes）なら、その予定。"""
+    from .settings import EventFilter
+    ef = ef or EventFilter()
+    span = pd.Timedelta(minutes=max(ef.minutes_before, ef.minutes_after, ef.unfixed_window_minutes))
+    sched = load_schedule() if schedule is None else schedule
+    evs = [e for e in recurring(t - span, t + span + pd.Timedelta(minutes=1)) if e.importance == "high"]
+    evs += [e for e in meetings(sched) if t - span <= e.time <= t + span]
+    cur = pair_currencies(ticker)
+    for e in sorted(evs, key=lambda e: e.time):
+        if not e.currencies & cur:
+            continue
+        if e.time_fixed:
+            lo, hi = e.time - pd.Timedelta(minutes=ef.minutes_before), e.time + pd.Timedelta(minutes=ef.minutes_after)
+        else:
+            w = pd.Timedelta(minutes=ef.unfixed_window_minutes)
+            lo, hi = e.time - w, e.time + w
+        if lo <= t <= hi:
+            return e
+    return None
+
+
 def near(e: Event, now: pd.Timestamp) -> str:
     """発表の前後の状況（"直前" / "直後" / ""）。時刻が決まっていない予定は前後3時間を広めにとる。"""
     before, after = (pd.Timedelta(hours=3), pd.Timedelta(hours=3)) if not e.time_fixed else \

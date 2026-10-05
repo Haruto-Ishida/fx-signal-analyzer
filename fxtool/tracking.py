@@ -152,6 +152,11 @@ def migrate(con: sqlite3.Connection) -> None:
     for c, typ in (("kind", "TEXT"), ("mode", "TEXT"), ("threshold", "REAL"), ("n_trials", "INTEGER")):
         if c not in reg_cols:
             con.execute(f"ALTER TABLE model_registry ADD COLUMN {c} {typ}")
+    # Step 7：シグナルを止めた理由（最大損失・キルスイッチ・経済指標）
+    if "suppress_reason" not in _columns(con, "signal_log"):
+        con.execute("ALTER TABLE signal_log ADD COLUMN suppress_reason TEXT")
+    con.executescript("""CREATE TABLE IF NOT EXISTS kill_switch_releases (
+        key TEXT PRIMARY KEY, released_at TEXT NOT NULL, note TEXT);""")
     # Step 6：GA の候補の検証結果
     ga_cols = _columns(con, "ga_candidates")
     for c, typ in (("verdict", "TEXT"), ("reason", "TEXT"), ("wf_total", "REAL"), ("wf_n", "INTEGER"),

@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import streamlit as st
 
-from dashboard import backtest_tab, famous_tab, ga_tab, ml_tab, signals_tab, tracking_tab
+from dashboard import backtest_tab, famous_tab, ga_tab, ml_tab, paper_tab, signals_tab, tracking_tab
 from dashboard.common import JST, Context
-from fxtool import data, events, indicators, jobs, tracking, trials
+from fxtool import data, events, indicators, jobs, killswitch, tracking, trials
 from fxtool import settings as user_settings
 from fxtool.config import (
     DAILY_MAX_LOSS_R, DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, PAIR_NAMES, PAIRS, TIMEFRAMES, WEEKLY_MAX_LOSS_R,
@@ -72,12 +72,18 @@ try:
     signal_log = tracking.load_signal_log(con, pair, tf_key)
     meta_model = jobs.latest_meta(con, pair, tf_key)
     n_trials_total = trials.count(con, pair, tf_key)
+    paper_acc, kill = killswitch.check(con, data.now_utc(), user_cfg, usdjpy)
 finally:
     con.close()
 closed = signal_log[signal_log["status"].isin(tracking.DONE)]
 # 本番の記録は初期値の損切り幅（jobs.RISK）で記録しているので、左の設定ではなく初期値で R を計算する
-halt = tracking.loss_halt(closed, data.now_utc(), jobs.RISK.sl_atr, pip_size(ticker), DAILY_MAX_LOSS_R,
-                          WEEKLY_MAX_LOSS_R)
+r_halt = tracking.loss_halt(closed, data.now_utc(), jobs.RISK.sl_atr, pip_size(ticker), DAILY_MAX_LOSS_R,
+                            WEEKLY_MAX_LOSS_R)
+# 停止の理由をまとめる：R で数える最大損失・キルスイッチ（ペーパー口座全体）・経済指標の前後
+blackout = events.blackout(ticker, data.now_utc(), user_cfg.event_filter)
+stop = [x for x in (r_halt.reason if r_halt.active else "", kill.reason,
+                    f"経済指標の前後（{blackout.name}・日本時間 {blackout.jst_label()}）のため" if blackout else "") if x]
+halt = tracking.Halt(bool(stop), " ／ ".join(stop), r_halt.day_r, r_halt.week_r)
 
 for w in user_cfg.warnings:
     st.warning(f"⚙️ 設定ファイル：{w}")
@@ -105,6 +111,7 @@ if n_conf < P.sma_long + P.atr_period:
 ctx = Context(pair, ticker, tf_key, tf, pip_size(ticker), price_digits(ticker), P, risk, ind, n_conf, weights,
               [], active_alerts, verdicts, boundary, float(balance), float(risk_pct), usdjpy,
               signal_log=signal_log, meta_model=meta_model, halt=halt, settings=user_cfg)
+ctx.paper, ctx.kill = paper_acc, kill
 
 with st.sidebar:
     st.divider()
@@ -147,8 +154,8 @@ m2.metric(f"ATR（{P.atr_period}）", f"{last_c['atr'] / ctx.pip:.1f} pips",
           help="1本の足の平均的な値幅。損切り・利確の幅の基準です。")
 m3.metric("最新の確定足", ctx.label(ind.index[n_conf - 1]))
 
-tab_signals, tab_backtest, tab_ml, tab_tracking, tab_famous, tab_ga = st.tabs(
-    ["📡 現在のシグナル", "🧪 バックテスト", "🤖 機械学習予測", "📒 記録と成績", "📚 有名手法", "🧬 GA探索"]
+tab_signals, tab_backtest, tab_ml, tab_tracking, tab_paper, tab_famous, tab_ga = st.tabs(
+    ["📡 現在のシグナル", "🧪 バックテスト", "🤖 機械学習予測", "📒 記録と成績", "💰 ペーパー口座", "📚 有名手法", "🧬 GA探索"]
 )
 with tab_signals:
     signals_tab.render(ctx)
@@ -158,6 +165,8 @@ with tab_ml:
     ml_tab.render(ctx)
 with tab_tracking:
     tracking_tab.render(ctx)
+with tab_paper:
+    paper_tab.render(ctx)
 with tab_famous:
     famous_tab.render(ctx)
 with tab_ga:
