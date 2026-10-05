@@ -41,3 +41,5 @@ rollover_spread_multiplier = 2.0    # ロールオーバーの時間帯（NY市�
 # 試す数の目安（研究ノート：試すほど偶然よく見えるものが見つかりやすい）
 ga_full_search = 500     # 本格的なGA探索 1回あたり
 ga_weekly_search = 100   # 週末の再探索 1回あたり（前回の上位候補の周辺だけ）
+# 週末の自動の再探索をするか（true / false）。1年で最大5,200通り増えるので、相談が終わるまでは false
+ga_weekly_enabled = false

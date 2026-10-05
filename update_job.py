@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from fxtool import data, jobs  # noqa: E402
+from fxtool import data, ga_jobs, jobs  # noqa: E402
 from fxtool.config import JOB_PAIRS, TIMEFRAMES  # noqa: E402
 
 
@@ -33,6 +33,14 @@ def main() -> int:
                 else:
                     logging.info(line)
                 print(line + (f" / エラー: {r.error}" if r.error else ""))
+                # 週末の GA の再探索（settings.toml で有効にしたときだけ。重い処理なので週末に）
+                try:
+                    if ga_jobs.weekly_due(con, pair, tf, data.now_utc()):
+                        run_id = ga_jobs.run(con, pair, tf, "neighborhood", origin="schedule")
+                        logging.info(f"{pair} {TIMEFRAMES[tf].label}: GA の週末の再探索（run {run_id}）")
+                except Exception as e:  # 再探索に失敗しても、記録の処理は止めない
+                    failed = True
+                    logging.error(f"{pair} {TIMEFRAMES[tf].label}: GA の週末の再探索でエラー: {e}")
     finally:
         con.close()
     return 1 if failed else 0

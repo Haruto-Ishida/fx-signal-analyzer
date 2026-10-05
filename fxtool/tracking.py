@@ -90,6 +90,19 @@ CREATE TABLE IF NOT EXISTS backtest_verdicts (
     dsr REAL, pbo REAL, n_trials INTEGER, wf_n INTEGER,
     PRIMARY KEY (pair, tf, source)
 );
+CREATE TABLE IF NOT EXISTS ga_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair TEXT NOT NULL, tf TEXT NOT NULL,
+    kind TEXT NOT NULL,              -- full（本格的な探索）/ neighborhood（週末の再探索）
+    seed INTEGER NOT NULL, budget INTEGER NOT NULL, n_evaluated INTEGER NOT NULL,
+    started_at TEXT NOT NULL, data_from TEXT, data_to TEXT, origin TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ga_candidates (
+    run_id INTEGER NOT NULL, rank INTEGER NOT NULL,
+    key TEXT NOT NULL, genes TEXT NOT NULL, rule TEXT NOT NULL,
+    fitness REAL, trades INTEGER, total_pips REAL, segment_sharpe TEXT,
+    PRIMARY KEY (run_id, rank)
+);
 CREATE TABLE IF NOT EXISTS log_state (
     pair TEXT NOT NULL, tf TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
     PRIMARY KEY (pair, tf, key)

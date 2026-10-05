@@ -53,6 +53,7 @@ class CostSettings:
 class TrialBudget:
     ga_full_search: int = 500
     ga_weekly_search: int = 100
+    ga_weekly_enabled: bool = False  # 週末の自動の再探索（1年分の試行数をユーザーと相談するまでは止めておく）
 
 
 # 安全のための上限・下限（設定ファイルで危ない値にされても、ここで止める）
@@ -62,6 +63,9 @@ LIMITS = {
     ("sizing", "fixed_risk_pct"): (0.0, 2.0),
     ("sizing", "max_leverage"): (0.0, 25.0),
     ("paper", "initial_balance"): (1_000, 1e10),
+    # ユーザーの決定：本格的な探索は1回500通りまで、週末の再探索は1回100通りまで
+    ("trial_budget", "ga_full_search"): (0, 500),
+    ("trial_budget", "ga_weekly_search"): (0, 100),
 }
 
 
@@ -102,6 +106,13 @@ def load(path: Path | None = None) -> Settings:
                 values[f.name] = default
                 continue
             v = sec[f.name]
+            if isinstance(default, bool):
+                # bool("false") は True になってしまうので、true / false 以外は初期値にする
+                if not isinstance(v, bool):
+                    warnings.append(f"[{name}] {f.name} の値「{v}」が true / false ではないため、初期値 {str(default).lower()} を使っています")
+                    v = default
+                values[f.name] = v
+                continue
             try:
                 v = type(default)(v)
             except (TypeError, ValueError):
