@@ -22,7 +22,11 @@ PERIODS_PER_YEAR = 252
 # ---------------- 日ごとの損益とシャープレシオ ----------------
 
 def business_days(start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
-    return pd.bdate_range(pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize())
+    """平日の日付。終わりが土日なら次の月曜まで含める（土日の決済は月曜に計上するため）。"""
+    end = pd.Timestamp(end).normalize()
+    if end.dayofweek >= 5:
+        end += pd.Timedelta(days=7 - end.dayofweek)
+    return pd.bdate_range(pd.Timestamp(start).normalize(), end)
 
 
 def daily_pnl(exit_times, pips, days: pd.DatetimeIndex) -> pd.Series:

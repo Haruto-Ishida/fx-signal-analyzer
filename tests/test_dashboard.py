@@ -115,8 +115,8 @@ def test_backtest_and_ml_tabs_use_dev_data_only(db, ctx, monkeypatch):
         seen["bt"] = (args[2].index[-1], args[-1])  # 3番目が開発用データ、最後が最終テスト期間の始まり
         raise RuntimeError("stop")
 
-    def fake_ml(pair, ind, *args, **kw):
-        seen["ml"] = (ind.index[-1], args[-1])
+    def fake_ml(pair, tf_key, ohlc, *args, **kw):
+        seen["ml"] = (ohlc.index[-1], args[-1])  # 3番目が開発用データ、最後が最終テスト期間の始まり
         raise RuntimeError("stop")
 
     monkeypatch.setattr(backtest_tab, "run", fake_bt)
