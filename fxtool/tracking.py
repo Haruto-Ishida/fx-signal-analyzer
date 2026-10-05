@@ -152,6 +152,13 @@ def migrate(con: sqlite3.Connection) -> None:
     for c, typ in (("kind", "TEXT"), ("mode", "TEXT"), ("threshold", "REAL"), ("n_trials", "INTEGER")):
         if c not in reg_cols:
             con.execute(f"ALTER TABLE model_registry ADD COLUMN {c} {typ}")
+    # Step 6：GA の候補の検証結果
+    ga_cols = _columns(con, "ga_candidates")
+    for c, typ in (("verdict", "TEXT"), ("reason", "TEXT"), ("wf_total", "REAL"), ("wf_n", "INTEGER"),
+                   ("wf_beat", "REAL"), ("rw_beat", "REAL"), ("dsr", "REAL"), ("pbo", "REAL"), ("n_trials", "INTEGER"),
+                   ("yearly", "TEXT"), ("validated_at", "TEXT")):
+        if c not in ga_cols:
+            con.execute(f"ALTER TABLE ga_candidates ADD COLUMN {c} {typ}")
     # 重みの計算元：以前のものは直近のバックテスト（＝最終テスト期間）から計算していた
     if "basis" not in _columns(con, "weight_history"):
         con.execute("ALTER TABLE weight_history ADD COLUMN basis TEXT NOT NULL DEFAULT 'backtest_recent'")

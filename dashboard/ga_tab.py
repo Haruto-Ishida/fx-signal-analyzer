@@ -63,4 +63,35 @@ def render(ctx: Context) -> None:
         "順位": cands["rank"], "ルール": cands["rule"], "適応度": cands["fitness"].round(2),
         "取引回数": cands["trades"], "損益(pips・コスト後)": cands["total_pips"].map(fmt_pips),
         "区間ごとのシャープレシオ": cands["segment_sharpe"].map(lambda x: " / ".join(f"{v:+.1f}" for v in json.loads(x))),
+        "検証の判定": cands["verdict"].fillna("未検証"),
     }), hide_index=True, width="stretch")
+
+    st.markdown(f"### 上位{ga_jobs.VALIDATE_TOP}個の検証")
+    st.caption(
+        "ほかの戦略と同じ合格基準（要件定義書 6-3）で調べます：ウォークフォワードの検証区間でコスト後プラス・取引100回以上・"
+        "ランダム売買とランダムウォークに勝つ・黒字の区間が6割以上・極端に悪い年がない・DSR 95%以上・PBO 50%未満。"
+        "探索のときと同じ設定なので、試行数は増えません。"
+    )
+    if st.button(f"🔍 上位{ga_jobs.VALIDATE_TOP}個を検証する", key="ga_validate"):
+        con = data.connect()
+        try:
+            with st.spinner("検証しています…（1〜3分）"):
+                ga_jobs.validate(con, ctx.pair, ctx.tf_key, int(r["id"]))
+        finally:
+            con.close()
+        st.rerun()
+    done = cands[cands["verdict"].notna()]
+    if len(done):
+        st.markdown(f"**{int(r['n_evaluated'])} 通り試して、その中で上位だったもの**の検証結果"
+                    f"（DSR は累計 {int(done['n_trials'].max()):,} 通りで割り引き）：")
+        for c in done.itertuples():
+            yearly = json.loads(c.yearly) if c.yearly else {}
+            with st.expander(f"{c.rank}位：{c.verdict} — {c.rule}"):
+                st.markdown(c.reason)
+                st.markdown(
+                    f"- 検証区間の損益：{fmt_pips(c.wf_total)}（{c.wf_n} 回）\n"
+                    f"- ランダム売買を上回った割合：{c.wf_beat:.0%}"
+                    + ("" if pd.isna(c.rw_beat) else f"、ランダムウォークを上回った割合：{c.rw_beat:.0%}")
+                    + f"\n- DSR：{'—' if pd.isna(c.dsr) else f'{c.dsr:.0%}'}、PBO：{'—' if pd.isna(c.pbo) else f'{c.pbo:.0%}'}"
+                    + ("\n- 年ごとの損益（検証区間）：" + "、".join(f"{y}年 {v:+,.0f}" for y, v in yearly.items()) if yearly else "")
+                )

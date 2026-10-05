@@ -332,6 +332,9 @@ def judge_signals(con, pair, tf_key, reg: dict, ind: pd.DataFrame) -> int:
 
 # ---------------- 戦略の判定（フェーズ2） ----------------
 
+VERDICT_STATE = f"{costmodel.COST_MODEL_VERSION}|{bt.VERDICT_VERSION}"  # コストの見積もり方か判定の基準が変わったら計算し直す
+
+
 def exit_rules(tf_key: str) -> bt.ExitRules:
     """トリプルバリア：利確・損切り（RISK）と、VERTICAL_BARRIER 本での時間切れ。反対シグナルでもドテン。"""
     return bt.ExitRules(opposite_exit=True, max_bars=VERTICAL_BARRIER[tf_key])
@@ -340,11 +343,14 @@ def exit_rules(tf_key: str) -> bt.ExitRules:
 def verdicts_due(con, pair, tf_key, ind_dev, n_trials: int) -> bool:
     """開発用データ（境界で固定）の最後の足で計算した判定がまだないか、試した数が増えて DSR の割り引きが古くなったか、
     コストの見積もり方が変わったら計算する。"""
-    if tracking.get_state(con, pair, tf_key, "verdict_cost_model") != costmodel.COST_MODEL_VERSION:
+    if tracking.get_state(con, pair, tf_key, "verdict_cost_model") != VERDICT_STATE:
         return True
+    # 最初からある5つの戦略の判定だけを見る（有名手法の判定は画面のボタンで計算し直すので、ここでは見ない）
+    keys = [s.key for s in strategies.STRATEGIES]
     rows = con.execute(
-        "SELECT n_trials FROM backtest_verdicts WHERE pair=? AND tf=? AND bar_time=? AND n_trials IS NOT NULL",
-        (pair, tf_key, ts_str(ind_dev.index[-1]))).fetchall()
+        f"""SELECT n_trials FROM backtest_verdicts WHERE pair=? AND tf=? AND bar_time=? AND n_trials IS NOT NULL
+            AND source IN ({",".join("?" * len(keys))})""",
+        (pair, tf_key, ts_str(ind_dev.index[-1]), *keys)).fetchall()
     if len(rows) < len(strategies.STRATEGIES):
         return True
     return min(r[0] for r in rows) < n_trials
@@ -357,7 +363,7 @@ def save_verdicts(con, pair, tf_key, dev: pd.DataFrame, b, costs, pip, now, n_tr
     mult = costmodel.spread_multipliers(dev.index, tf_key, s.costs, s.event_filter)
     rep = bt.evaluate_all(dev[["open", "high", "low", "close"]], P, RISK, exit_rules(tf_key), costs, pip,
                           runs=VERDICT_RANDOM_RUNS, holdout_start=b.start, rw_paths=VERDICT_RW_PATHS, spread_mult=mult)
-    tracking.set_state(con, pair, tf_key, "verdict_cost_model", costmodel.COST_MODEL_VERSION)
+    tracking.set_state(con, pair, tf_key, "verdict_cost_model", VERDICT_STATE)
     trials.record(con, rep.trials, pair=pair, tf=tf_key, origin="job", now=now,
                   data_from=dev.index[0], data_to=dev.index[-1], n_bars=len(dev))
     rep = bt.finalize(rep, n_trials)  # この処理で試す予定の分を含めた、すべての試行の数で DSR を割り引く

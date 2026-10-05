@@ -43,7 +43,7 @@ _LABELS = {
     "bb_pos": "ボリンジャーバンド内の位置", "bb_width": "ボリンジャーバンドの幅",
     "atr_pct": "ATR（価格に対する%）", "atr_ratio": "ATRの変化（直近 ÷ 過去100本平均）",
     "dc_hi_dist": "直前高値までの距離", "dc_lo_dist": "直前安値までの距離",
-    "hour_sin": "時間帯(sin)", "hour_cos": "時間帯(cos)", "dow_sin": "曜日(sin)", "dow_cos": "曜日(cos)",
+    "fd_close": "分数階差分（過去の水準の情報を残した値動き）", "hour_sin": "時間帯(sin)", "hour_cos": "時間帯(cos)", "dow_sin": "曜日(sin)", "dow_cos": "曜日(cos)",
 }
 
 
@@ -53,8 +53,11 @@ def feature_label(name: str) -> str:
     return _LABELS.get(name, name)
 
 
-def make_features(ind: pd.DataFrame, tf_key: str) -> pd.DataFrame:
-    """値幅に関わる特徴量は ATR で割って、時期や通貨ペアが違っても同じ尺度になるようにする。"""
+def make_features(ind: pd.DataFrame, tf_key: str, fracdiff: bool = False) -> pd.DataFrame:
+    """値幅に関わる特徴量は ATR で割って、時期や通貨ペアが違っても同じ尺度になるようにする。
+
+    fracdiff=True で分数階差分の特徴量（fd_close）を加える。本番のモデルは使っていない
+    （特徴量を変えるのはチャレンジャー扱い：シャドーモード4週間とユーザーの承認が必要）。"""
     c, a = ind["close"], ind["atr"]
     f = pd.DataFrame(index=ind.index)
     for k in LOOKBACKS[tf_key]:
@@ -79,6 +82,9 @@ def make_features(ind: pd.DataFrame, tf_key: str) -> pd.DataFrame:
     dow = ind.index.dayofweek.to_numpy()
     f["dow_sin"] = np.sin(2 * np.pi * dow / 7)
     f["dow_cos"] = np.cos(2 * np.pi * dow / 7)
+    if fracdiff:
+        from .fracdiff import fd_feature
+        f["fd_close"] = fd_feature(c)
     return f.replace([np.inf, -np.inf], np.nan)
 
 

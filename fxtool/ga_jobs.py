@@ -12,6 +12,7 @@ import sqlite3
 
 import pandas as pd
 
+from . import backtest as bt
 from . import costmodel, data, ga, jobs, trials
 from . import settings as user_settings
 from .tracking import JST, ts_str
@@ -58,6 +59,41 @@ def run(con: sqlite3.Connection, pair: str, tf: str, kind: str = "full", seed: i
          for i, r in enumerate(res.evaluated.head(TOP_SAVE).itertuples())])
     con.commit()
     return run_id
+
+
+VALIDATE_TOP = 5
+
+
+def validate(con: sqlite3.Connection, pair: str, tf: str, run_id: int, top_n: int = VALIDATE_TOP,
+             origin: str = "dashboard", now: pd.Timestamp | None = None, runs: int = 200, rw_paths: int = 20) -> int:
+    """探索の上位 top_n 個を、ほかの戦略と同じ検証（ウォークフォワード・ランダム売買・ランダムウォーク・PBO・DSR・年別）に
+    かけ、結果を ga_candidates に保存する。開発用データだけを使う。探索のときと同じ設定なので、試行数は増えない。
+    DSR は、その時点の累計の試行数（GA の探索で試した分を含む）で割り引く。"""
+    now = data.now_utc() if now is None else now
+    s = user_settings.load()
+    cands = load_candidates(con, run_id).head(top_n)
+    sts = [ga.to_strategy(genome_from_genes(json.loads(g))) for g in cands["genes"]]
+    dev = data.load_dev(con, pair, tf)[["open", "high", "low", "close"]]
+    b = data.boundary(con, pair, tf)
+    costs, pip = jobs.default_costs(pair), jobs.pip_size(jobs.PAIRS[pair])
+    mult = costmodel.spread_multipliers(dev.index, tf, s.costs, s.event_filter)
+    rules = jobs.exit_rules(tf)
+    planned = bt.planned_trials(jobs.P, jobs.RISK, rules, sts)
+    n_trials = trials.count_with(con, pair, tf, planned)
+    rep = bt.evaluate_all(dev, jobs.P, jobs.RISK, rules, costs, pip, runs=runs, holdout_start=b.start,
+                          rw_paths=rw_paths, n_trials=n_trials, strategy_list=sts, spread_mult=mult)
+    trials.record(con, rep.trials, pair=pair, tf=tf, origin=origin, now=now, data_from=dev.index[0],
+                  data_to=dev.index[-1], n_bars=len(dev), note=f"GA の候補の検証（run {run_id}）")
+    for rank, r in zip(cands["rank"], rep.reports):
+        y = {int(row.year): round(float(row.total), 1) for row in r.yearly_wf.itertuples()} if len(r.yearly_wf) else {}
+        con.execute(
+            """UPDATE ga_candidates SET verdict=?, reason=?, wf_total=?, wf_n=?, wf_beat=?, rw_beat=?, dsr=?, pbo=?,
+               n_trials=?, yearly=?, validated_at=? WHERE run_id=? AND rank=?""",
+            (r.verdict[0], r.verdict[1], float(r.wf.test_metrics["total"]), int(r.wf.test_metrics["n"]), float(r.wf_beat),
+             jobs._num(r.rw_beat), jobs._num(r.dsr.get("dsr")), jobs._num(r.pbo.get("pbo")), rep.n_trials,
+             json.dumps(y), ts_str(now), run_id, int(rank)))
+    con.commit()
+    return rep.n_trials
 
 
 def genome_from_genes(genes: dict) -> tuple[int, int, int]:

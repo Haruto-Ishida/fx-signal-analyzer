@@ -493,7 +493,8 @@ def finalize(rep: Report, n_trials: int) -> Report:
         rep.best_dsr = overfit.deflated_sharpe(rep.grid_daily[rep.best_config].to_numpy(), rep.n_trials, rep.sr_variance)
     for r in rep.reports:
         r.dsr = overfit.deflated_sharpe(r.wf_daily.to_numpy(), rep.n_trials, rep.sr_variance)
-        r.verdict = assess(r.wf, r.wf_beat, rep.k, r.dsr.get("dsr", math.nan), r.pbo.get("pbo", math.nan))
+        r.verdict = assess(r.wf, r.wf_beat, rep.k, r.dsr.get("dsr", math.nan), r.pbo.get("pbo", math.nan),
+                           r.rw_beat, r.yearly_wf)
     return rep
 
 
@@ -528,11 +529,25 @@ def trial_rows(reports: list[StrategyReport], base: IndicatorParams, risk: RiskP
     return rows
 
 
-def assess(wf: WalkForwardResult, beat: float, k: int, dsr: float = math.nan, pbo: float = math.nan) -> tuple[str, str]:
-    """ウォークフォワードの検証区間の成績から、優位性がありそうかを機械的に判定する。
+VERDICT_VERSION = "v2-rw-yearly"   # 判定の基準を変えたら上げる（保存済みの判定を計算し直すため）
+WORST_YEAR_SHARE = 0.5             # 1年の損失が、検証区間の利益合計のこの割合を超えたら「極端に悪い年」（暫定。ユーザーと相談）
 
-    「有望」は、取引100回以上・ランダム売買の95%以上を上回る・黒字の区間が6割以上・
-    DSR（試した数で割り引いたシャープレシオ）95%以上・PBO（パラメータ選びの過学習の確率）50%未満、をすべて満たすときだけ。
+
+def worst_year(yearly_df: pd.DataFrame | None, total: float) -> tuple[int, float] | None:
+    """極端に悪い年（1年の損失が利益合計の WORST_YEAR_SHARE を超える）があれば (年, 損益)。"""
+    if yearly_df is None or len(yearly_df) == 0 or total <= 0:
+        return None
+    w = yearly_df.loc[yearly_df["total"].idxmin()]
+    return (int(w["year"]), float(w["total"])) if -w["total"] > WORST_YEAR_SHARE * total else None
+
+
+def assess(wf: WalkForwardResult, beat: float, k: int, dsr: float = math.nan, pbo: float = math.nan,
+           rw_beat: float = math.nan, yearly_df: pd.DataFrame | None = None) -> tuple[str, str]:
+    """ウォークフォワードの検証区間の成績から、優位性がありそうかを機械的に判定する（要件定義書 6-3 の合格基準）。
+
+    「有望」は、取引100回以上・ランダム売買の95%以上を上回る・ランダムウォークの価格での成績の95%以上を上回る・
+    黒字の区間が6割以上・極端に悪い年がない・DSR（試した数で割り引いたシャープレシオ）95%以上・
+    PBO（パラメータ選びの過学習の確率）50%未満、をすべて満たすときだけ。
     """
     m = wf.test_metrics
     if m["n"] < 20:
@@ -541,8 +556,15 @@ def assess(wf: WalkForwardResult, beat: float, k: int, dsr: float = math.nan, pb
         return "優位性なし", "コストを含めると、まだ見ていない期間でマイナスでした。"
     if beat < 0.95:
         return "偶然の範囲", f"検証区間ではプラスでしたが、ランダム売買の {beat:.0%} しか上回っておらず、偶然でも出る程度の成績です。"
+    if not math.isnan(rw_beat) and rw_beat < 0.95:
+        return "偶然の範囲", (f"ランダム売買には勝ちましたが、でたらめに動く価格（ランダムウォーク）で同じルールを動かした成績の "
+                          f"{rw_beat:.0%} しか上回っておらず、このルールが値動きの特徴をとらえているとは言えません。")
     if wf.positive_folds < math.ceil(k * 0.6):
         return "不安定", f"合計ではランダム売買を上回りましたが、黒字の区間は {wf.positive_folds}/{k} だけで、一部の期間に頼った成績です。"
+    bad = worst_year(yearly_df, m["total"])
+    if bad:
+        return "不安定", (f"合計ではプラスですが、{bad[0]}年に {bad[1]:+,.0f} pips と、利益合計（{m['total']:+,.0f} pips）の"
+                        f"{WORST_YEAR_SHARE:.0%}を超える損失を出した年があります。")
     base = f"検証区間でプラス、ランダム売買の {beat:.0%} を上回り、{wf.positive_folds}/{k} 区間で黒字でした。"
     if m["n"] < MIN_TRADES_RELIABLE:
         return "参考値", base + f"ただし取引が {m['n']} 回と少ない（{MIN_TRADES_RELIABLE}回未満）ため、参考値として扱います。"
