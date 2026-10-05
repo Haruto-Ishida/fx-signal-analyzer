@@ -43,3 +43,14 @@ ga_full_search = 500     # 本格的なGA探索 1回あたり
 ga_weekly_search = 100   # 週末の再探索 1回あたり（前回の上位候補の周辺だけ）
 # 週末の自動の再探索をするか（true / false）。1年で最大5,200通り増えるので、相談が終わるまでは false
 ga_weekly_enabled = false
+
+[papers]
+# 論文ウォッチ：arXiv（論文の公開サイト）の公式 API から、新しい論文の情報（題名・著者・日付・概要・リンク）を集める
+# 週末の自動収集をするか（true / false）。外部のサイトに接続するので、初期値は false
+enabled = false
+# 検索キーワード（どれか1つを題名か概要に含む論文）
+keywords = ["foreign exchange", "forex", "exchange rate forecasting", "currency trading", "financial time series machine learning"]
+# 分野（arXiv のカテゴリ。どれか1つに当てはまる論文）
+categories = ["q-fin.TR", "q-fin.ST", "q-fin.CP", "cs.LG", "stat.ML"]
+# 1回に集める最大の件数（1〜200）
+max_results = 50

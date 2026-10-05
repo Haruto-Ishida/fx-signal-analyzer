@@ -56,6 +56,15 @@ class TrialBudget:
     ga_weekly_enabled: bool = False  # 週末の自動の再探索（1年分の試行数をユーザーと相談するまでは止めておく）
 
 
+@dataclass(frozen=True)
+class Papers:
+    enabled: bool = False   # 週末の自動収集（外部への接続なので、ユーザーが有効にするまで止めておく）
+    keywords: tuple[str, ...] = ("foreign exchange", "forex", "exchange rate forecasting", "currency trading",
+                                 "financial time series machine learning")
+    categories: tuple[str, ...] = ("q-fin.TR", "q-fin.ST", "q-fin.CP", "cs.LG", "stat.ML")
+    max_results: int = 50
+
+
 # 安全のための上限・下限（設定ファイルで危ない値にされても、ここで止める）
 LIMITS = {
     ("sizing", "kelly_fraction"): (0.0, 0.5),
@@ -66,6 +75,7 @@ LIMITS = {
     # ユーザーの決定：本格的な探索は1回500通りまで、週末の再探索は1回100通りまで
     ("trial_budget", "ga_full_search"): (0, 500),
     ("trial_budget", "ga_weekly_search"): (0, 100),
+    ("papers", "max_results"): (1, 200),
 }
 
 
@@ -77,11 +87,12 @@ class Settings:
     event_filter: EventFilter = EventFilter()
     costs: CostSettings = CostSettings()
     trial_budget: TrialBudget = TrialBudget()
+    papers: Papers = Papers()
     warnings: tuple[str, ...] = field(default=(), compare=False)
 
 
 _SECTIONS = {"paper": Paper, "sizing": Sizing, "kill_switch": KillSwitch, "event_filter": EventFilter,
-             "costs": CostSettings, "trial_budget": TrialBudget}
+             "costs": CostSettings, "trial_budget": TrialBudget, "papers": Papers}
 
 
 def load(path: Path | None = None) -> Settings:
@@ -112,6 +123,12 @@ def load(path: Path | None = None) -> Settings:
                     warnings.append(f"[{name}] {f.name} の値「{v}」が true / false ではないため、初期値 {str(default).lower()} を使っています")
                     v = default
                 values[f.name] = v
+                continue
+            if isinstance(default, tuple):
+                if not (isinstance(v, list) and all(isinstance(x, str) and x.strip() for x in v)):
+                    warnings.append(f"[{name}] {f.name} は文字列のリスト（例：[\"a\", \"b\"]）で書いてください。初期値を使っています")
+                    v = default
+                values[f.name] = tuple(x.strip() for x in v)
                 continue
             try:
                 v = type(default)(v)

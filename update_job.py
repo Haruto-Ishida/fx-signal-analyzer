@@ -10,7 +10,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from fxtool import data, ga_jobs, jobs  # noqa: E402
+from fxtool import data, ga_jobs, jobs, papers  # noqa: E402
+from fxtool import settings as user_settings  # noqa: E402
 from fxtool.config import JOB_PAIRS, TIMEFRAMES  # noqa: E402
 
 
@@ -41,6 +42,15 @@ def main() -> int:
                 except Exception as e:  # 再探索に失敗しても、記録の処理は止めない
                     failed = True
                     logging.error(f"{pair} {TIMEFRAMES[tf].label}: GA の週末の再探索でエラー: {e}")
+        # 論文ウォッチの週1回の収集（settings.toml の [papers] enabled = true のときだけ。外部に接続する）
+        try:
+            p = user_settings.load().papers
+            if papers.weekly_due(con, p, data.now_utc()):
+                n, new = papers.fetch(con, p, data.now_utc(), origin="schedule")
+                logging.info(f"論文ウォッチ：{n}件中、新しい論文 {new}件")
+        except Exception as e:
+            failed = True
+            logging.error(f"論文ウォッチでエラー: {e}")
     finally:
         con.close()
     return 1 if failed else 0
