@@ -1,0 +1,8 @@
+# Python環境・キャッシュ
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 取得データ・学習済みモデル・ログ（いつでも作り直せる。サイズも大きい）
+data/

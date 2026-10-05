@@ -1,0 +1,164 @@
+"""現在の相場の解説（フェーズ5）。
+
+ルールにもとづいて、計算済みの数値だけから日本語の文章を組み立てる（AI による文章生成は使わない）。
+そのため、根拠のない理由を書くことはないが、ニュースや経済指標などの数値にない情報は扱えない。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable
+
+import pandas as pd
+
+from .config import IndicatorParams, RiskParams
+from .strategies import StrategyView
+from .tracking import MLStatus, score_label, weighted_score
+
+JST = pd.Timedelta(hours=9)
+WEAK_VERDICTS = {"優位性なし", "偶然の範囲", "不安定", "判断材料不足"}
+MAX_CAUTIONS = 6
+NEWS_CAVEAT = ("経済指標の発表やニュース（要人発言・金融政策・地政学リスクなど）は考慮していません。"
+               "発表の前後は値動きが急変し、損切りの価格を飛び越えることもあります。")
+
+
+@dataclass
+class Commentary:
+    stance: str                 # 買い寄り / 売り寄り / 中立 など
+    headline: str
+    reasons: list[str] = field(default_factory=list)
+    cautions: list[str] = field(default_factory=list)
+
+
+def _signal_text(key: str, direction: int, p: IndicatorParams) -> str:
+    buy = direction > 0
+    return {
+        "ma_cross": f"短期線（SMA{p.sma_short}）が長期線（SMA{p.sma_long}）を{'上抜け（ゴールデンクロス）' if buy else '下抜け（デッドクロス）'}",
+        "macd_cross": f"MACDがシグナル線を{'上抜け' if buy else '下抜け'}",
+        "breakout": f"終値が直前{p.donchian_period}本の{'高値を上抜け' if buy else '安値を下抜け'}",
+        "rsi_reversal": (f"RSIが売られすぎ（{p.rsi_low:g}未満）から回復" if buy
+                         else f"RSIが買われすぎ（{p.rsi_high:g}超）から低下"),
+        "bb_reversion": f"終値が{'−' if buy else '+'}{p.bb_std:g}σの外からバンド内に戻った",
+    }[key]
+
+
+def _when(bars_ago: int) -> str:
+    return "最新の確定足" if bars_ago == 0 else f"{bars_ago}本前"
+
+
+def build(
+    ind: pd.DataFrame, n_conf: int, views: list[StrategyView], weights: dict[str, float], ml: list[MLStatus],
+    alerts: pd.DataFrame, verdicts: pd.DataFrame, tf_key: str, pip: float, digits: int,
+    p: IndicatorParams, risk: RiskParams, now: pd.Timestamp, label: Callable[[pd.Timestamp], str],
+) -> Commentary:
+    last = ind.iloc[n_conf - 1]
+    fmt = lambda x: f"{x:.{digits}f}"  # noqa: E731
+    verdict_of = dict(zip(verdicts["source"], verdicts["verdict"])) if not verdicts.empty else {}
+    alerts_of: dict[str, list[str]] = {}
+    for a in alerts.itertuples():
+        alerts_of.setdefault(a.source, []).append(a.message)
+
+    active = [v for v in views if v.decision in ("買い", "売り")]
+    buys = [v for v in active if v.decision == "買い"]
+    sells = [v for v in active if v.decision == "売り"]
+    ml_used = [m for m in ml if m.ok and m.decision in ("買い", "売り")]
+    score = weighted_score({v.strategy.key: v.decision for v in views}, weights)  # 重みがなければ全て1
+    stance = score_label(score)
+    proven = any(verdict_of.get(v.strategy.key) == "有望（要継続監視）" for v in active) or bool(ml_used)
+
+    # ---------------- 結論 ----------------
+    if not active and not ml_used:
+        headline = "様子見：いまはどの戦略からも有効なシグナルが出ていません。"
+    else:
+        parts = []
+        if buys:
+            parts.append(f"{'・'.join(v.strategy.name for v in buys)}が買い")
+        if sells:
+            parts.append(f"{'・'.join(v.strategy.name for v in sells)}が売り")
+        for m in ml_used:
+            parts.append(f"機械学習（{m.name}）が{m.decision}")
+        headline = f"{stance}（重み付き総合スコア {score:+.2f}）：{'、'.join(parts)}のシグナルを出しています。"
+    if active and not proven:
+        headline += "ただし、過去の検証で優位性が確認できた手法ではないため、根拠としては弱いシグナルです。"
+
+    # ---------------- なぜこのシグナルか ----------------
+    reasons = []
+    for v in active:
+        reasons.append(
+            f"**{v.strategy.name}**（{v.strategy.kind}）：{_signal_text(v.strategy.key, v.direction, p)}"
+            f"（{_when(v.bars_ago)}）→ {v.decision}。エントリー目安 {fmt(v.entry)}、"
+            f"損切り {fmt(v.sl)}（{-risk.sl_atr * v.atr / pip:.1f} pips）、利確 {fmt(v.tp)}（+{risk.tp_atr * v.atr / pip:.1f} pips）。"
+        )
+
+    up_trend = last["sma_s"] > last["sma_l"]
+    above_long = last["close"] > last["sma_l"]
+    if up_trend and above_long:
+        trend = "価格が長期線の上にあり、短期線も長期線の上にあるので、**上昇トレンド**の形です。"
+    elif not up_trend and not above_long:
+        trend = "価格が長期線の下にあり、短期線も長期線の下にあるので、**下降トレンド**の形です。"
+    else:
+        trend = "価格と移動平均線の位置関係がそろっておらず、**トレンドがはっきりしない（転換点かもみ合い）**状態です。"
+    rsi = last["rsi"]
+    rsi_txt = "買われすぎ" if rsi > p.rsi_high else "売られすぎ" if rsi < p.rsi_low else "過熱感なし"
+    hist, prev_hist = last["macd_hist"], ind["macd_hist"].iat[n_conf - 2]
+    if hist > 0:
+        mom = "上向きの勢いが" + ("強まっています" if hist > prev_hist else "弱まりつつあります")
+    else:
+        mom = "下向きの勢いが" + ("強まっています" if hist < prev_hist else "弱まりつつあります")
+    reasons.append(f"{trend}RSIは {rsi:.0f}（{rsi_txt}）、MACDは{mom}。")
+
+    if ml:
+        ml_parts = []
+        for m in ml:
+            when = "" if m.bar_time == ind.index[n_conf - 1] else f"（{label(m.bar_time)}時点）"
+            ml_parts.append(f"{m.name}は{m.horizon}本後に上がる確率 {m.p:.0%}{when}")
+        if ml_used:
+            tail = "予測力の条件を満たしたモデルの判断を含めています。"
+        else:
+            tail = "どちらも予測力が確認できていないため、判断材料にはしていません。"
+        reasons.append("機械学習：" + "、".join(ml_parts) + "。" + tail)
+
+    # ---------------- 注意点 ----------------
+    cautions = []
+    if buys and sells:
+        cautions.append("戦略によって買いと売りに判断が分かれています。方向感がはっきりしない相場の可能性があります。")
+    for v in active:
+        counter = (v.direction > 0 and not up_trend and not above_long) or (v.direction < 0 and up_trend and above_long)
+        if counter:
+            cautions.append(f"{v.strategy.name}の{v.decision}は、いまのトレンドと逆向きです。トレンドが続くと損切りになりやすい点に注意してください。")
+    for v in active:
+        for msg in alerts_of.get(v.strategy.key, []):
+            cautions.append(f"警告中：{msg}")
+        vd = verdict_of.get(v.strategy.key)
+        if vd in WEAK_VERDICTS:
+            cautions.append(f"{v.strategy.name}は、過去データの検証（ウォークフォワード）で「{vd}」と判定されています。")
+        w = weights.get(v.strategy.key)
+        if w is not None and w < 0.8:
+            cautions.append(f"{v.strategy.name}の重みは {w:.2f} と低めです（直近の成績が振るわない）。")
+
+    atr_ratio = last["atr"] / ind["atr"].iloc[max(0, n_conf - 100):n_conf].mean()
+    if atr_ratio >= 1.3:
+        cautions.append(f"値動きが普段より大きくなっています（ATRが過去100本平均の {atr_ratio:.1f} 倍）。損切り幅も広くなるので、取引量に注意してください。")
+    elif atr_ratio <= 0.7:
+        cautions.append(f"値動きが普段より小さくなっています（ATRが過去100本平均の {atr_ratio:.1f} 倍）。小さな値動きが続いた後は、急に大きく動くことがあります。")
+    if rsi > 80 or rsi < 20:
+        cautions.append(f"RSIが {rsi:.0f} と極端な水準です。行き過ぎた値動きの反動が起きやすい状態です。")
+
+    if tf_key == "1h":
+        jst_now = now + JST
+        if 5 <= jst_now.hour < 8:
+            cautions.append("日本時間の早朝は取引量が少なく、スプレッドが広がりやすい時間帯です。")
+        elif 21 <= jst_now.hour or jst_now.hour < 1:
+            cautions.append("日本時間の21時〜翌1時ごろは米国の経済指標の発表が集中し、値動きが急に大きくなりやすい時間帯です。")
+        if (jst_now.dayofweek == 4 and jst_now.hour >= 20) or (jst_now.dayofweek == 5 and jst_now.hour < 7):
+            cautions.append("週末をまたいでポジションを持つと、月曜の取引開始時に窓を開けて大きく動くことがあります。")
+    for msg in alerts_of.get("data", []):
+        cautions.append(f"警告中：{msg}")
+
+    # 重複を除き、件数を絞って、最後に必ずニュースの注意を付ける
+    seen, uniq = set(), []
+    for c in cautions:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    cautions = uniq[: MAX_CAUTIONS - 1] + [NEWS_CAVEAT]
+    return Commentary(stance, headline, reasons, cautions)

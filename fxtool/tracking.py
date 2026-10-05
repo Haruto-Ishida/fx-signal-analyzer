@@ -1,0 +1,356 @@
+"""シグナル・予測の記録、戦略の重み、成績悪化の警告（フェーズ4）。"""
+from __future__ import annotations
+
+import math
+import sqlite3
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
+from . import backtest as bt
+from . import strategies
+from .config import IndicatorParams, RiskParams
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS signal_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair TEXT NOT NULL, tf TEXT NOT NULL, source TEXT NOT NULL,
+    signal_time TEXT NOT NULL,
+    direction INTEGER NOT NULL,
+    entry REAL NOT NULL, sl REAL NOT NULL, tp REAL NOT NULL, atr REAL NOT NULL,
+    max_bars INTEGER NOT NULL,
+    prob REAL, weight REAL,
+    logged_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT '進行中',
+    exit_time TEXT, exit_price REAL, pips REAL,
+    UNIQUE (pair, tf, source, signal_time)
+);
+CREATE TABLE IF NOT EXISTS prediction_log (
+    pair TEXT NOT NULL, tf TEXT NOT NULL, model TEXT NOT NULL, horizon INTEGER NOT NULL,
+    bar_time TEXT NOT NULL,
+    p REAL NOT NULL, decision TEXT NOT NULL, version TEXT NOT NULL,
+    logged_at TEXT NOT NULL,
+    y REAL,
+    PRIMARY KEY (pair, tf, model, horizon, bar_time)
+);
+CREATE TABLE IF NOT EXISTS model_registry (
+    version TEXT PRIMARY KEY,
+    pair TEXT NOT NULL, tf TEXT NOT NULL, model TEXT NOT NULL, horizon INTEGER NOT NULL,
+    trained_at TEXT NOT NULL,
+    trained_bar TEXT NOT NULL,       -- 学習した時点の最新の確定足（再学習の間隔の基準）
+    trained_through TEXT NOT NULL,   -- 学習に使った最後の足（これより後の足の予測は学習データ外）
+    n_train INTEGER NOT NULL,
+    acc REAL, majority_acc REAL, logloss REAL, base_logloss REAL, trade_pips REAL, beat REAL,
+    ok INTEGER NOT NULL,
+    path TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS weight_history (
+    pair TEXT NOT NULL, tf TEXT NOT NULL, bar_time TEXT NOT NULL, source TEXT NOT NULL,
+    weight REAL NOT NULL, recent_n INTEGER, recent_pips REAL, recent_pf REAL, z REAL,
+    PRIMARY KEY (pair, tf, bar_time, source)
+);
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair TEXT NOT NULL, tf TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL,
+    level TEXT NOT NULL, message TEXT NOT NULL,
+    created_at TEXT NOT NULL, resolved_at TEXT
+);
+CREATE TABLE IF NOT EXISTS job_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair TEXT NOT NULL, tf TEXT NOT NULL, origin TEXT NOT NULL,
+    started_at TEXT NOT NULL, finished_at TEXT, summary TEXT, error TEXT
+);
+CREATE TABLE IF NOT EXISTS backtest_verdicts (
+    pair TEXT NOT NULL, tf TEXT NOT NULL, source TEXT NOT NULL,
+    computed_at TEXT NOT NULL, bar_time TEXT NOT NULL,
+    verdict TEXT NOT NULL, reason TEXT NOT NULL, wf_total REAL, wf_beat REAL,
+    PRIMARY KEY (pair, tf, source)
+);
+CREATE TABLE IF NOT EXISTS log_state (
+    pair TEXT NOT NULL, tf TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+    PRIMARY KEY (pair, tf, key)
+);
+"""
+
+TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def ts_str(ts: pd.Timestamp) -> str:
+    return pd.Timestamp(ts).strftime(TS_FMT)
+
+
+def get_state(con: sqlite3.Connection, pair: str, tf: str, key: str) -> str | None:
+    row = con.execute("SELECT value FROM log_state WHERE pair=? AND tf=? AND key=?", (pair, tf, key)).fetchone()
+    return row[0] if row else None
+
+
+def set_state(con: sqlite3.Connection, pair: str, tf: str, key: str, value: str) -> None:
+    con.execute("INSERT OR REPLACE INTO log_state VALUES (?, ?, ?, ?)", (pair, tf, key, value))
+
+
+# ---------------- 重み ----------------
+
+@dataclass
+class RecentPerf:
+    source: str
+    n: int
+    total: float
+    pf: float
+    z: float
+    weight: float = 1.0
+
+
+def z_score(pips: np.ndarray) -> float:
+    """1取引あたり平均が 0 から標準誤差いくつ分離れているか。取引が少ないときは 0。"""
+    if len(pips) < 5:
+        return 0.0
+    sd = pips.std(ddof=1)
+    return 0.0 if sd == 0 else float(pips.mean() / (sd / math.sqrt(len(pips))))
+
+
+def weight_from_z(z: float) -> float:
+    """控えめな重み：z ±1 ごとに ±0.25。0.25〜1.75 の範囲に収める。"""
+    return float(np.clip(1 + 0.25 * np.clip(z, -3, 3), 0.25, 1.75))
+
+
+def recent_performance(
+    ind: pd.DataFrame, p: IndicatorParams, risk: RiskParams, costs: bt.Costs, pip: float, recent_bars: int,
+) -> list[RecentPerf]:
+    """直近 recent_bars 本で各戦略を売買した成績（フェーズ2と同じエンジン）と、そこから決めた重み。"""
+    bars = bt.Bars(ind)
+    n = len(ind)
+    start = max(bt.WARMUP, n - recent_bars)
+    out = []
+    for s in strategies.STRATEGIES:
+        sig = strategies.signals(ind, s, p).tolist()
+        t = bt.simulate(bars, sig, risk, bt.ExitRules(), costs, pip, start, n)
+        m = bt.metrics(t["pips"])
+        z = z_score(t["pips"].to_numpy())
+        out.append(RecentPerf(s.key, m["n"], m["total"], m["pf"], z, weight_from_z(z)))
+    mean_w = float(np.mean([r.weight for r in out]))
+    for r in out:
+        r.weight /= mean_w  # 平均が 1 になるようにそろえる
+    return out
+
+
+def weighted_score(decisions: dict[str, str], weights: dict[str, float]) -> float:
+    """各戦略の判断（買い=+1・売り=−1・様子見=0）の重み付き平均。−1〜+1。"""
+    num = sum(weights.get(k, 1.0) * {"買い": 1, "売り": -1}.get(d, 0) for k, d in decisions.items())
+    den = sum(weights.get(k, 1.0) for k in decisions)
+    return num / den if den else 0.0
+
+
+def score_label(score: float) -> str:
+    if score >= 0.4:
+        return "買い寄り"
+    if score <= -0.4:
+        return "売り寄り"
+    if score >= 0.15:
+        return "やや買い寄り"
+    if score <= -0.15:
+        return "やや売り寄り"
+    return "中立"
+
+
+def latest_weights(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
+    return pd.read_sql_query(
+        """SELECT * FROM weight_history WHERE pair=? AND tf=? AND bar_time =
+           (SELECT MAX(bar_time) FROM weight_history WHERE pair=? AND tf=?)""",
+        con, params=(pair, tf, pair, tf),
+    )
+
+
+# ---------------- 警告 ----------------
+
+@dataclass
+class Condition:
+    source: str
+    kind: str
+    level: str      # "warning" / "critical"
+    message: str
+
+
+def sync_alerts(con: sqlite3.Connection, pair: str, tf: str, active: list[Condition], now: pd.Timestamp) -> int:
+    """いま成り立っている警告を登録し、成り立たなくなった警告は解決済みにする。新しく出した件数を返す。"""
+    open_rows = con.execute(
+        "SELECT id, source, kind FROM alerts WHERE pair=? AND tf=? AND resolved_at IS NULL", (pair, tf)
+    ).fetchall()
+    open_keys = {(s, k): i for i, s, k in open_rows}
+    active_keys = {(c.source, c.kind) for c in active}
+    added = 0
+    for c in active:
+        if (c.source, c.kind) in open_keys:
+            con.execute("UPDATE alerts SET message=?, level=? WHERE id=?", (c.message, c.level, open_keys[(c.source, c.kind)]))
+        else:
+            con.execute(
+                "INSERT INTO alerts (pair, tf, source, kind, level, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (pair, tf, c.source, c.kind, c.level, c.message, ts_str(now)),
+            )
+            added += 1
+    for key, i in open_keys.items():
+        if key not in active_keys:
+            con.execute("UPDATE alerts SET resolved_at=? WHERE id=?", (ts_str(now), i))
+    return added
+
+
+def strategy_conditions(recent: list[RecentPerf], closed_logs: pd.DataFrame, period_label: str) -> list[Condition]:
+    names = {s.key: s.name for s in strategies.STRATEGIES}
+    out = []
+    for r in recent:
+        name = names[r.source]
+        if r.n >= 10 and r.z <= -2:
+            out.append(Condition(r.source, "recent_bad", "critical",
+                                 f"{name}：{period_label}の成績が統計的にはっきりマイナスです（{r.total:+,.0f} pips、{r.n}回、PF {r.pf:.2f}）"))
+        elif r.n >= 10 and r.pf < 0.8:
+            out.append(Condition(r.source, "recent_bad", "warning",
+                                 f"{name}：{period_label}の成績が悪化しています（{r.total:+,.0f} pips、{r.n}回、PF {r.pf:.2f}）"))
+    if not closed_logs.empty:
+        for source, g in closed_logs.groupby("source"):
+            name = names.get(source, source)
+            last = g.sort_values("exit_time").tail(20)
+            m = bt.metrics(last["pips"])
+            if m["n"] >= 10 and m["pf"] < 0.8:
+                out.append(Condition(source, "live_bad", "warning",
+                                     f"{name}：記録したシグナルの直近{m['n']}回の成績が悪化しています（{m['total']:+,.0f} pips、PF {m['pf']:.2f}）"))
+            streak = 0
+            for v in g.sort_values("exit_time")["pips"].to_numpy()[::-1]:
+                if v >= 0:
+                    break
+                streak += 1
+            if streak >= 6:
+                out.append(Condition(source, "losing_streak", "warning", f"{name}：記録したシグナルが {streak} 連敗中です"))
+    return out
+
+
+def model_conditions(registry: pd.DataFrame, preds: pd.DataFrame) -> list[Condition]:
+    """registry は1モデル分の履歴（古い順）、preds はそのモデルの答え合わせ済みの予測。"""
+    out = []
+    if registry.empty:
+        return out
+    latest = registry.iloc[-1]
+    source = f"ml_{latest['model']}"
+    label = MODEL_NAMES.get(latest["model"], latest["model"])
+    if not latest["ok"] and registry["ok"].iloc[:-1].astype(bool).any():
+        out.append(Condition(source, "lost_edge", "warning",
+                             f"{label}：再学習の結果、予測力の条件を満たさなくなりました（以前は満たしていました）"))
+    recent = preds.dropna(subset=["y"]).sort_values("bar_time").tail(200)
+    n = len(recent)
+    if n >= 50:
+        acc = float(((recent["p"] >= 0.5) == (recent["y"] == 1)).mean())
+        h = int(latest["horizon"])
+        se = math.sqrt(acc * (1 - acc) / (n / h))
+        if acc + 1.96 * se < 0.5:
+            out.append(Condition(source, "live_acc", "critical",
+                                 f"{label}：実際の予測の正解率が {acc:.1%}（直近{n}件）で、50%をはっきり下回っています"))
+        elif pd.notna(latest["acc"]) and acc < latest["acc"] - 0.05:
+            out.append(Condition(source, "live_acc", "warning",
+                                 f"{label}：実際の予測の正解率 {acc:.1%}（直近{n}件）が、検証時の {latest['acc']:.1%} より大きく低くなっています"))
+    return out
+
+
+MODEL_NAMES = {"logistic": "ロジスティック回帰", "gbm": "勾配ブースティング"}
+
+
+def data_condition(last_bar: pd.Timestamp, now: pd.Timestamp, bar: pd.Timedelta, stale_bars: int) -> list[Condition]:
+    """平日（土日を除く）に、最新の足が古すぎる場合に警告する。"""
+    if now.dayofweek >= 5 or (now.dayofweek == 0 and now.hour < 6):  # 週末と週明け直後は休場
+        return []
+    if now - (last_bar + bar) > bar * stale_bars:
+        return [Condition("data", "stale", "warning",
+                          f"データが更新されていません（最新の確定足：{last_bar:%Y-%m-%d %H:%M} UTC）。接続や取得元を確認してください")]
+    return []
+
+
+# ---------------- 読み出し ----------------
+
+def _numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """数値の列を必ず数値型にする。列がすべて NULL（例：決済前のシグナルだけ）だと、
+    pandas は型のわからない列（object）として読み込み、四捨五入などが失敗するため。"""
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+    return df
+
+
+def load_signal_log(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        "SELECT * FROM signal_log WHERE pair=? AND tf=? ORDER BY signal_time", con, params=(pair, tf),
+        parse_dates=["signal_time", "exit_time", "logged_at"],
+    )
+    return _numeric(df, ["entry", "sl", "tp", "atr", "prob", "weight", "exit_price", "pips"])
+
+
+def load_predictions(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        "SELECT * FROM prediction_log WHERE pair=? AND tf=? ORDER BY bar_time", con, params=(pair, tf),
+        parse_dates=["bar_time", "logged_at"],
+    )
+    return _numeric(df, ["p", "y"])
+
+
+def load_registry(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        "SELECT * FROM model_registry WHERE pair=? AND tf=? ORDER BY trained_at", con, params=(pair, tf),
+        parse_dates=["trained_at", "trained_bar", "trained_through"],
+    )
+    return _numeric(df, ["acc", "majority_acc", "logloss", "base_logloss", "trade_pips", "beat"])
+
+
+def load_alerts(con: sqlite3.Connection, pair: str | None = None, tf: str | None = None,
+                active_only: bool = False) -> pd.DataFrame:
+    q = "SELECT * FROM alerts WHERE 1=1"
+    params: list = []
+    if pair:
+        q += " AND pair=?"
+        params.append(pair)
+    if tf:
+        q += " AND tf=?"
+        params.append(tf)
+    if active_only:
+        q += " AND resolved_at IS NULL"
+    return pd.read_sql_query(q + " ORDER BY created_at DESC", con, params=params,
+                             parse_dates=["created_at", "resolved_at"])
+
+
+def load_weight_history(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        "SELECT * FROM weight_history WHERE pair=? AND tf=? ORDER BY bar_time", con, params=(pair, tf),
+        parse_dates=["bar_time"],
+    )
+    return _numeric(df, ["weight", "recent_pips", "recent_pf", "z"])
+
+
+def load_verdicts(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
+    df = pd.read_sql_query("SELECT * FROM backtest_verdicts WHERE pair=? AND tf=?", con, params=(pair, tf),
+                           parse_dates=["computed_at", "bar_time"])
+    return _numeric(df, ["wf_total", "wf_beat"])
+
+
+@dataclass
+class MLStatus:
+    model: str
+    name: str
+    horizon: int
+    p: float
+    decision: str
+    ok: bool
+    bar_time: pd.Timestamp
+
+
+def latest_ml_status(con: sqlite3.Connection, pair: str, tf: str) -> list[MLStatus]:
+    """各モデルの最新の予測と、そのとき使ったモデルが条件を満たしていたか。"""
+    rows = con.execute(
+        """SELECT p.model, p.horizon, p.p, p.decision, r.ok, p.bar_time FROM prediction_log p
+           JOIN model_registry r ON r.version = p.version
+           WHERE p.pair=? AND p.tf=? AND p.bar_time = (
+               SELECT MAX(bar_time) FROM prediction_log q
+               WHERE q.pair=p.pair AND q.tf=p.tf AND q.model=p.model AND q.horizon=p.horizon)
+           ORDER BY p.model""", (pair, tf),
+    ).fetchall()
+    return [MLStatus(m, MODEL_NAMES.get(m, m), int(h), float(pv), d, bool(ok), pd.Timestamp(t))
+            for m, h, pv, d, ok, t in rows]
+
+
+def load_job_runs(con: sqlite3.Connection, limit: int = 50) -> pd.DataFrame:
+    return pd.read_sql_query(f"SELECT * FROM job_runs ORDER BY id DESC LIMIT {int(limit)}", con,
+                             parse_dates=["started_at", "finished_at"])
