@@ -21,7 +21,8 @@ import numpy as np
 import pandas as pd
 
 from . import backtest as bt
-from . import costmodel, data, events, holdout, indicators, killswitch, ml, ml_eval, strategies, tracking, trials
+from . import (costmodel, data, events, holdout, indicators, killswitch, ml, ml_eval, mlops, strategies, tracking,
+               trials)
 from . import settings as user_settings
 from .config import (
     DAILY_MAX_LOSS_R, DEFAULT_SLIPPAGE, DEFAULT_SPREAD, LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, ML_META_FOLDS,
@@ -108,6 +109,19 @@ def run_cycle(
     return res
 
 
+SCHEDULE_GAP = pd.Timedelta(hours=3)  # 毎時の定期実行がこれ以上動いていなければ、画面で知らせる
+
+
+def schedule_gap(con, now: pd.Timestamp) -> pd.Timedelta | None:
+    """最後の定期実行（タスクスケジューラ）から SCHEDULE_GAP 以上たっていれば、その時間。定期実行の記録がなければ None。
+    （パソコンが止まっていた・ログオフしていた・電源につながっていなかった など。要件定義書 9-1）"""
+    last = con.execute("SELECT MAX(started_at) FROM job_runs WHERE origin='schedule'").fetchone()[0]
+    if last is None:
+        return None
+    gap = now - pd.Timestamp(last)
+    return gap if gap >= SCHEDULE_GAP else None
+
+
 def closed_signals(con, pair, tf_key) -> pd.DataFrame:
     sl = tracking.load_signal_log(con, pair, tf_key)
     return sl[sl["status"].isin(tracking.DONE)]
@@ -160,18 +174,27 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
     fill_entries(con, pair, tf_key, raw)
 
     # この処理で試す予定の設定も含めた「試した数」。戦略の判定と機械学習の条件を、同じ数で割り引く
+    spec = mlops.current_spec(con, pair, tf_key)
     planned = (bt.planned_trials(P, RISK, exit_rules(tf_key))
-               + ml_eval.planned_trials("meta", ML_META_THRESHOLD, VERTICAL_BARRIER[tf_key], ML_META_FOLDS))
+               + ml_eval.planned_trials("meta", ML_META_THRESHOLD, VERTICAL_BARRIER[tf_key], ML_META_FOLDS, spec.features))
     n_trials = trials.count_with(con, pair, tf_key, planned)
 
-    # 機械学習（メタラベリング）：再学習の前に、それまでのモデルで新しいシグナルを判定する
-    reg = latest_meta(con, pair, tf_key)
+    # 機械学習（メタラベリング）：再学習の前に、それまでのモデルで新しいシグナルを判定する。
+    # 前のバージョンに戻して固定しているときは、そのモデルを使い、自動の再学習はしない
+    reg = mlops.active_meta(con, pair, tf_key)
+    pinned = mlops.pinned_version(con, pair, tf_key) is not None
     if reg is not None:
         res.meta_judged += judge_signals(con, pair, tf_key, reg, ind)
-    if retrain and meta_retrain_due(reg, ind, settings.retrain_every, n_trials):
-        reg = train_meta(con, pair, tf_key, ind, ind_dev, b, costs, pip, now, n_trials)
+    if (retrain and not pinned and (meta_retrain_due(reg, ind, settings.retrain_every, n_trials)
+                                    or (reg is not None and (reg.get("features") or "v2") != spec.features))):
+        reg = train_meta(con, pair, tf_key, ind, ind_dev, b, costs, pip, now, n_trials, spec)
         res.retrained = True
         res.meta_judged += judge_signals(con, pair, tf_key, reg, ind)
+
+    # チャレンジャー（シャドーモード）：裏で判定だけ記録し、条件を満たしたらユーザーに提案する
+    if retrain:
+        mlops.shadow_cycle(con, pair, tf_key, ind, RISK, P, costs, pip, now)
+        mlops.review(con, pair, tf_key, ind_dev, b, P, RISK, costs, pip, now, n_trials)
 
     if retrain and verdicts_due(con, pair, tf_key, ind_dev, n_trials):
         save_verdicts(con, pair, tf_key, holdout.dev_part(conf, b), b, costs, pip, now, n_trials)
@@ -192,6 +215,15 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
         conds.append(tracking.Condition("risk", "max_loss", "critical", halt.reason))
     for t in kill.trips:
         conds.append(tracking.Condition("risk", f"kill_{t.kind}", "critical", "キルスイッチ：" + t.reason))
+    ch = mlops.challengers(con, pair, tf_key)
+    for c in ch[ch["status"] == "ready"].itertuples():
+        conds.append(tracking.Condition("ml_meta", f"challenger_{c.id}", "warning",
+                                        f"機械学習：チャレンジャー「{mlops.SPECS[c.spec].label}」が入れ替えの条件を満たしました。"
+                                        "「機械学習予測」タブで確認して、承認するか決めてください"))
+    if mlops.pinned_version(con, pair, tf_key):
+        conds.append(tracking.Condition("ml_meta", "pinned", "warning",
+                                        f"機械学習：前のバージョン（{mlops.pinned_version(con, pair, tf_key)}）に戻して固定しています。"
+                                        "自動の再学習は止まっています"))
     res.new_alerts = tracking.sync_alerts(con, pair, tf_key, conds, now)
     con.commit()
 
@@ -282,12 +314,8 @@ def fill_entries(con, pair, tf_key, raw: pd.DataFrame) -> int:
 # ---------------- 機械学習（メタラベリング） ----------------
 
 def latest_meta(con, pair, tf_key) -> dict | None:
-    cur = con.execute(
-        "SELECT * FROM model_registry WHERE pair=? AND tf=? AND model='meta' ORDER BY trained_at DESC LIMIT 1",
-        (pair, tf_key),
-    )
-    row = cur.fetchone()
-    return dict(zip([c[0] for c in cur.description], row)) if row else None
+    """本番で使うメタラベリングのモデル（前のバージョンに戻して固定していればそれ。mlops.active_meta）。"""
+    return mlops.active_meta(con, pair, tf_key)
 
 
 def meta_retrain_due(reg: dict | None, ind: pd.DataFrame, every: int, n_trials: int) -> bool:
@@ -299,21 +327,23 @@ def meta_retrain_due(reg: dict | None, ind: pd.DataFrame, every: int, n_trials: 
     return len(ind) - pos >= every
 
 
-def train_meta(con, pair, tf_key, ind, ind_dev, b, costs, pip, now, n_trials: int) -> dict:
-    """条件の判定とモデルの選択は開発用データだけで行い（同じ期間・同じ試行数なら使い回す）、
-    本番モデルは選んだモデルの種類のまま、決着したすべてのラベルで学習する。"""
+def train_meta(con, pair, tf_key, ind, ind_dev, b, costs, pip, now, n_trials: int, spec=None) -> dict:
+    """条件の判定とモデルの選択は開発用データだけで行い（同じ期間・同じ試行数・同じ特徴量なら使い回す）、
+    本番モデルは選んだモデルの種類のまま、決着したすべてのラベルで学習する。spec は本番の設定（mlops.MetaSpec）。"""
+    spec = spec or mlops.SPECS["base"]
     max_bars = VERTICAL_BARRIER[tf_key]
     holdout.assert_dev_only(ind_dev, b)
     eval_to = ts_str(ind_dev.index[-1])
     cur = con.execute(
         """SELECT kind, acc, majority_acc, logloss, base_logloss, trade_pips, beat, ok, eval_from, n_trials
            FROM model_registry WHERE pair=? AND tf=? AND model='meta' AND eval_to=? AND threshold=?
-           ORDER BY trained_at DESC LIMIT 1""", (pair, tf_key, eval_to, ML_META_THRESHOLD))
+             AND COALESCE(features, 'v2')=?
+           ORDER BY trained_at DESC LIMIT 1""", (pair, tf_key, eval_to, ML_META_THRESHOLD, spec.features))
     prev = cur.fetchone()
     if prev is not None and prev[-1] == n_trials:
         evald = dict(zip([c[0] for c in cur.description], prev))
     else:
-        smp_dev = ml_eval.build_meta(ind_dev, tf_key, P, RISK, max_bars, costs.round_trip, pip)
+        smp_dev = ml_eval.build_meta(ind_dev, tf_key, P, RISK, max_bars, costs.round_trip, pip, fracdiff=spec.fracdiff)
         rep = ml_eval.evaluate_all(smp_dev, ML_META_THRESHOLD, ML_META_FOLDS, runs=META_RANDOM_RUNS)
         trials.record(con, rep.trials, pair=pair, tf=tf_key, origin="job", now=now,
                       data_from=ind_dev.index[0], data_to=ind_dev.index[-1], n_bars=len(ind_dev))
@@ -324,9 +354,10 @@ def train_meta(con, pair, tf_key, ind, ind_dev, b, costs, pip, now, n_trials: in
                      base_logloss=ad.base_logloss, trade_pips=ad.trade_metrics["total"], beat=ad.beat, ok=int(ad.ok),
                      eval_from=ts_str(ind_dev.index[ad.folds[0][0]]), n_trials=n_now)
 
-    smp = ml_eval.build_meta(ind, tf_key, P, RISK, max_bars, costs.round_trip, pip)  # 決着したラベルだけ
+    smp = ml_eval.build_meta(ind, tf_key, P, RISK, max_bars, costs.round_trip, pip, fracdiff=spec.fracdiff)  # 決着したラベルだけ
     model = ml_eval.fit_production(smp, evald["kind"])
-    version = f"{pair.replace('/', '')}_{tf_key}_meta_{evald['kind']}_{now:%Y%m%d%H%M%S}"
+    version = (f"{pair.replace('/', '')}_{tf_key}_meta_{evald['kind']}{'_fd' if spec.fracdiff else ''}"
+               f"_{now:%Y%m%d%H%M%S}")
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     path = MODELS_DIR / f"{version}.joblib"
     joblib.dump(model, path)
@@ -335,6 +366,7 @@ def train_meta(con, pair, tf_key, ind, ind_dev, b, costs, pip, now, n_trials: in
         trained_bar=ts_str(ind.index[-1]), trained_through=ts_str(ind.index[int(smp.t0.max())]), n_train=len(smp.y),
         **evald, path=path.relative_to(ROOT).as_posix(), eval_to=eval_to,
         train_from=ts_str(ind.index[int(smp.t0.min())]), mode="meta", threshold=ML_META_THRESHOLD,
+        features=spec.features,
     )
     con.execute(f"INSERT OR REPLACE INTO model_registry ({', '.join(reg)}) VALUES ({', '.join('?' * len(reg))})",
                 tuple(reg.values()))
@@ -353,7 +385,7 @@ def judge_signals(con, pair, tf_key, reg: dict, ind: pd.DataFrame) -> int:
     rows = [(rid, src, pos[pd.Timestamp(t)], d) for rid, src, t, d in rows if pd.Timestamp(t) in pos]
     if not rows:
         return 0
-    F = ml.make_features(ind, tf_key)
+    F = ml.make_features(ind, tf_key, fracdiff=mlops.model_features(reg))  # そのモデルを学習したときと同じ特徴量
     X = ml_eval.meta_features(F, np.array([r[2] for r in rows]), np.array([r[3] for r in rows]),
                               np.array([r[1] for r in rows]))
     ok = ~X.isna().any(axis=1).to_numpy()

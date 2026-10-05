@@ -63,6 +63,7 @@ class Samples:
     risk: RiskParams | None = None         # 方向：上下同じ幅のバリア
     costs: bt.Costs | None = None
     pip: float = 0.01
+    features: str = "v2"                   # 特徴量の版（v2 ＝ これまで／v2+fd ＝ 分数階差分を追加）。試行の記録に使う
 
 
 def _fit(template, kind: str, X, y, w):
@@ -96,8 +97,8 @@ def meta_features(F: pd.DataFrame, i: np.ndarray, d: np.ndarray, source: np.ndar
 
 
 def build_meta(ind: pd.DataFrame, tf_key: str, p: IndicatorParams, risk: RiskParams, max_bars: int,
-               cost_pips: float, pip: float) -> Samples:
-    F = make_features(ind, tf_key)
+               cost_pips: float, pip: float, fracdiff: bool = False) -> Samples:
+    F = make_features(ind, tf_key, fracdiff=fracdiff)
     events = signal_events(ind, p)
     tb = labeling.triple_barrier(ind, events, risk, max_bars, cost_pips, pip)
     tb["source"] = events["source"].to_numpy()[tb["ev"].to_numpy()]
@@ -105,7 +106,8 @@ def build_meta(ind: pd.DataFrame, tf_key: str, p: IndicatorParams, risk: RiskPar
     ok = ~X.isna().any(axis=1).to_numpy()
     tb, X = tb[ok].reset_index(drop=True), X[ok].reset_index(drop=True)
     return Samples("meta", X, (tb["pips"].to_numpy() > 0).astype(float), tb["i"].to_numpy(), tb["t1"].to_numpy(),
-                   tb["pips"].to_numpy(), np.full(len(tb), np.nan), tb["source"].to_numpy(), ind.index, max_bars)
+                   tb["pips"].to_numpy(), np.full(len(tb), np.nan), tb["source"].to_numpy(), ind.index, max_bars,
+                   features="v2+fd" if fracdiff else "v2")
 
 
 def build_direction(ind: pd.DataFrame, tf_key: str, width: float, max_bars: int, costs: bt.Costs, pip: float) -> Samples:
@@ -354,12 +356,13 @@ class Report:
     trials: list[dict] = field(default_factory=list)
 
 
-def planned_trials(mode: str, threshold: float, max_bars: int, k: int = 5) -> list[dict]:
+def planned_trials(mode: str, threshold: float, max_bars: int, k: int = 5, features: str = "v2",
+                   kinds=tuple(LADDER)) -> list[dict]:
     """evaluate_all が試す設定（3つのモデル）。"""
     from .trials import ml_config
     label = "triple_barrier_meta" if mode == "meta" else "triple_barrier_direction"
-    return [{"family": "ml", "name": kind, "config": ml_config(kind, max_bars, threshold, label=label, features="v2", k=k)}
-            for kind in LADDER]
+    return [{"family": "ml", "name": kind, "config": ml_config(kind, max_bars, threshold, label=label, features=features, k=k)}
+            for kind in kinds]
 
 
 def choose_model(results: dict[str, Result]) -> tuple[str, list[str]]:
@@ -388,7 +391,7 @@ def evaluate_all(smp: Samples, threshold: float, k: int = 5, runs: int = 200, n_
     from .trials import ml_config
     label = "triple_barrier_meta" if smp.mode == "meta" else "triple_barrier_direction"
     rep.trials = [{"family": "ml", "name": r.kind, "purpose": "ml_eval_v2",
-                   "config": ml_config(r.kind, smp.max_bars, threshold, label=label, features="v2", k=k),
+                   "config": ml_config(r.kind, smp.max_bars, threshold, label=label, features=smp.features, k=k),
                    "metrics": {"acc": r.acc, "logloss": r.logloss, "base_logloss": r.base_logloss, "auc": r.auc,
                                "trade": r.trade_metrics, "beat_random": r.beat}} for r in results.values()]
     return finalize(rep, smp, n_trials if n_trials is not None else len(results) * len(THRESHOLDS[smp.mode]))

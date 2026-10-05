@@ -73,6 +73,7 @@ try:
     meta_model = jobs.latest_meta(con, pair, tf_key)
     n_trials_total = trials.count(con, pair, tf_key)
     paper_acc, kill = killswitch.check(con, data.now_utc(), user_cfg, usdjpy)
+    sched_gap = jobs.schedule_gap(con, data.now_utc())
 finally:
     con.close()
 closed = signal_log[signal_log["status"].isin(tracking.DONE)]
@@ -87,6 +88,12 @@ halt = tracking.Halt(bool(stop), " ／ ".join(stop), r_halt.day_r, r_halt.week_r
 
 for w in user_cfg.warnings:
     st.warning(f"⚙️ 設定ファイル：{w}")
+if sched_gap is not None:
+    st.warning(
+        f"⏰ **自動更新（毎時）が {sched_gap.total_seconds() / 3600:.0f} 時間動いていません。**"
+        "パソコンがスリープ・電源オフ・ログオフだったか、電源につながっていなかった可能性があります。"
+        "その間に確定した足のシグナルは、次に動いたときにまとめて記録します（いま画面を開いたので、この通貨ペア・時間足は記録しました）。"
+    )
 if cyc.data_error:
     st.warning(f"データの更新に失敗したため、保存済みのデータで表示しています。（{cyc.data_error}）")
 if cyc.error:

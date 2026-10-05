@@ -62,6 +62,8 @@ def render(ctx: Context) -> None:
         f"🔒 検証は開発用データ（{ctx.label(dev.index[0])} 〜 {ctx.label(dev.index[-1])}）だけで行います。"
         f"{ctx.label(ctx.boundary.start)} 以降の最終テスト期間は使いません。"
     )
+    from . import mlops_section
+    mlops_section.render(ctx)
     with st.container(border=True):
         c = st.columns(4)
         mode = c[0].radio("方法", list(ml_eval.MODES), format_func=lambda m: ml_eval.MODES[m])
@@ -242,5 +244,6 @@ def render(ctx: Context) -> None:
             "- **モデルの順番**：ロジスティック回帰 → ランダムフォレスト → 勾配ブースティング。複雑なモデルは単純なモデルにコスト後の成績で勝ったときだけ採用します。"
             "ハイパーパラメータは固定です（検証結果を見ながら調整すると、それ自体が過去への合わせ込みになるため）。\n"
             f"- **試した数**：{rep.n_trials} 通り（戦略・機械学習・研究ノート反映前の推定分を含む）。DSR はこの数で割り引いています。\n"
-            "- **未対応**：CPCV（複数の検証経路）と分数階差分は、研究ノートで「余裕があれば」とされているため、今回は入れていません。"
+            "- **未対応**：CPCV（複数の検証経路）は、研究ノートで「余裕があれば」とされているため、今回は入れていません。"
+            "分数階差分は、本番とは別の「チャレンジャー」として試せます（上の「本番モデルの管理」）。"
         )

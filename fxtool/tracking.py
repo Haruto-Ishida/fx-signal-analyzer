@@ -103,6 +103,19 @@ CREATE TABLE IF NOT EXISTS ga_candidates (
     fitness REAL, trades INTEGER, total_pips REAL, segment_sharpe TEXT,
     PRIMARY KEY (run_id, rank)
 );
+CREATE TABLE IF NOT EXISTS challengers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair TEXT NOT NULL, tf TEXT NOT NULL,
+    spec TEXT NOT NULL,              -- チャレンジャーの設定の名前（mlops.SPECS）
+    kind TEXT NOT NULL,              -- モデルの種類（登録したときの本番と同じ）
+    status TEXT NOT NULL,            -- shadow（シャドーモード）/ ready（入れ替えの提案中）/ approved / rejected
+    created_at TEXT NOT NULL, decided_at TEXT, note TEXT, last_check TEXT
+);
+CREATE TABLE IF NOT EXISTS shadow_judgments (
+    challenger_id INTEGER NOT NULL, signal_id INTEGER NOT NULL,
+    p REAL NOT NULL, decision TEXT NOT NULL, version TEXT NOT NULL, judged_at TEXT NOT NULL,
+    PRIMARY KEY (challenger_id, signal_id)
+);
 CREATE TABLE IF NOT EXISTS log_state (
     pair TEXT NOT NULL, tf TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
     PRIMARY KEY (pair, tf, key)
@@ -152,6 +165,9 @@ def migrate(con: sqlite3.Connection) -> None:
     for c, typ in (("kind", "TEXT"), ("mode", "TEXT"), ("threshold", "REAL"), ("n_trials", "INTEGER")):
         if c not in reg_cols:
             con.execute(f"ALTER TABLE model_registry ADD COLUMN {c} {typ}")
+    # Step 8：モデルの特徴量の版（NULL ＝ v2）
+    if "features" not in _columns(con, "model_registry"):
+        con.execute("ALTER TABLE model_registry ADD COLUMN features TEXT")
     # Step 7：シグナルを止めた理由（最大損失・キルスイッチ・経済指標）
     if "suppress_reason" not in _columns(con, "signal_log"):
         con.execute("ALTER TABLE signal_log ADD COLUMN suppress_reason TEXT")
