@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from fxtool import commentary, data, sizing, strategies, tracking
+from fxtool import commentary, data, events, sizing, strategies, tracking
 from fxtool.config import LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, MIN_UNITS
 
 from .common import BUY_COLOR, NEUTRAL_COLOR, SELL_COLOR, Context, color_decision
@@ -18,11 +18,15 @@ def render(ctx: Context) -> None:
     last_c = ind.iloc[n_conf - 1]
 
     # ---------------- 相場の解説（フェーズ5） ----------------
+    now = data.now_utc()
+    upcoming = events.upcoming(ctx.ticker, now, hours=48, include_low=True)
+    meta = {v.strategy.key: m for v in views if (m := ctx.meta_for(v.strategy.key, v.signal_time)) is not None}
     c = commentary.build(
-        ind, n_conf, views, ctx.weights, ctx.ml_status,
+        ind, n_conf, views, ctx.weights,
         ctx.alerts if not ctx.alerts.empty else pd.DataFrame(columns=["source", "message"]),
         ctx.verdicts if not ctx.verdicts.empty else pd.DataFrame(columns=["source", "verdict"]),
-        ctx.tf_key, pip, digits, P, risk, data.now_utc(), ctx.label,
+        ctx.tf_key, pip, digits, P, risk, now, ctx.label,
+        meta=meta, meta_ok=bool(ctx.meta_model and ctx.meta_model.get("ok")), halt=ctx.halt, upcoming=upcoming,
     )
     with st.container(border=True):
         st.markdown("#### 📝 いまの相場の解説")
@@ -34,6 +38,23 @@ def render(ctx: Context) -> None:
             f"{ctx.label(ind.index[n_conf - 1])} の確定足までの数値から、決まったルールで自動作成した文章です（AIによる文章生成ではありません）。"
             "売買を勧めるものではありません。"
             + ("" if not ctx.verdicts.empty else " 戦略の検証結果がまだ計算されていないため、検証にもとづく注意点は含まれていません。")
+        )
+
+    # ---------------- これからの予定 ----------------
+    important = [e for e in upcoming if e.importance == "high"]
+    with st.expander(f"📅 これからの予定（48時間以内・{ctx.pair}に関係するもの）：重要 {len(important)} 件", expanded=bool(important)):
+        if important:
+            st.dataframe(pd.DataFrame([{
+                "日本時間": e.jst_label(), "予定": e.name,
+                "状況": {"直前": "⚠️ まもなく", "直後": "⚠️ 発表直後"}.get(events.near(e, now), ""),
+                "補足": e.note,
+            } for e in important]), hide_index=True, width="stretch")
+        else:
+            st.write("48時間以内に、重要な予定（米雇用統計・FOMC・日銀会合）はありません。")
+        st.caption(
+            "決まった発表時刻だけで判断しています（米雇用統計は原則第1金曜、FOMC・日銀会合は日程ファイル "
+            "`central_bank_schedule.csv`）。米国の夏時間は自動で計算しています。CPIなど日付が月ごとに変わる指標や、"
+            "臨時の発表・要人発言は含まれていません。"
         )
 
     if ctx.halt is not None and ctx.halt.active:

@@ -5,7 +5,7 @@ import streamlit as st
 
 from dashboard import backtest_tab, ml_tab, signals_tab, tracking_tab
 from dashboard.common import JST, Context
-from fxtool import data, indicators, jobs, tracking
+from fxtool import data, events, indicators, jobs, tracking
 from fxtool.config import (
     DAILY_MAX_LOSS_R, DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, PAIR_NAMES, PAIRS, TIMEFRAMES, WEEKLY_MAX_LOSS_R,
     IndicatorParams, RiskParams, pip_size, price_digits,
@@ -73,6 +73,9 @@ if cyc.data_error:
     st.warning(f"データの更新に失敗したため、保存済みのデータで表示しています。（{cyc.data_error}）")
 if cyc.error:
     st.warning(f"記録・再学習の処理でエラーが起きました（表示は続けます）：{cyc.error}")
+need_update, update_msg = events.schedule_status(events.load_schedule(), data.now_utc() + JST)
+if need_update:
+    st.warning(f"📅 **FOMC・日銀会合の日程ファイルの更新が必要です**：{update_msg}")
 for a in active_alerts.itertuples():
     (st.error if a.level == "critical" else st.warning)(
         f"🔔 {a.message}（{(a.created_at + JST):%Y/%m/%d %H:%M} から・詳しくは「記録と成績」タブ）"

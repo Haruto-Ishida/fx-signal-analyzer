@@ -1,23 +1,28 @@
-"""現在の相場の解説（フェーズ5）。
+"""現在の相場の解説（フェーズ5。研究ノートを反映した改修版）。
 
 ルールにもとづいて、計算済みの数値だけから日本語の文章を組み立てる（AI による文章生成は使わない）。
-そのため、根拠のない理由を書くことはないが、ニュースや経済指標などの数値にない情報は扱えない。
+そのため、根拠のない理由を書くことはないが、ニュースや経済指標の結果など数値にない情報は扱えない。
+
+根拠の強さは、過去の検証の判定に加えて「試した組み合わせの数」「DSR（偶然ではない確率）」「PBO（パラメータ選びの
+過学習の確率）」で示す。機械学習（メタラベリング）の判定、最大損失による停止、決まった時刻の予定も書く。
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable
 
 import pandas as pd
 
+from . import events as ev
 from .config import IndicatorParams, RiskParams
 from .strategies import StrategyView
-from .tracking import MLStatus, score_label, weighted_score
+from .tracking import score_label, weighted_score
 
 JST = pd.Timedelta(hours=9)
 WEAK_VERDICTS = {"優位性なし", "偶然の範囲", "不安定", "判断材料不足", "参考値", "偶然の可能性", "過学習の疑い"}
-MAX_CAUTIONS = 6
-NEWS_CAVEAT = ("経済指標の発表やニュース（要人発言・金融政策・地政学リスクなど）は考慮していません。"
+MAX_CAUTIONS = 7
+NEWS_CAVEAT = ("経済指標の結果やニュース（要人発言・金融政策・地政学リスクなど）の中身は考慮していません。"
                "発表の前後は値動きが急変し、損切りの価格を飛び越えることもあります。")
 
 
@@ -45,28 +50,55 @@ def _when(bars_ago: int) -> str:
     return "最新の確定足" if bars_ago == 0 else f"{bars_ago}本前"
 
 
+def _num(row: dict, key: str) -> float:
+    v = row.get(key)
+    return math.nan if v is None or pd.isna(v) else float(v)
+
+
+def _evidence(row: dict) -> str:
+    """過去の検証の判定と、試した数・DSR・PBO。"""
+    parts = []
+    n, dsr, pbo = _num(row, "n_trials"), _num(row, "dsr"), _num(row, "pbo")
+    if not math.isnan(dsr):
+        parts.append(f"偶然ではない確率（DSR）{dsr:.0%}")
+    if not math.isnan(pbo):
+        parts.append(f"パラメータ選びの過学習の確率（PBO）{pbo:.0%}")
+    detail = "・".join(parts)
+    if not math.isnan(n):
+        detail = f"{int(n)}通り試した中で" + (f"、{detail}" if detail else "")
+    return f"過去の検証では「{row['verdict']}」" + (f"（{detail}）" if detail else "") + "。"
+
+
 def build(
-    ind: pd.DataFrame, n_conf: int, views: list[StrategyView], weights: dict[str, float], ml: list[MLStatus],
+    ind: pd.DataFrame, n_conf: int, views: list[StrategyView], weights: dict[str, float],
     alerts: pd.DataFrame, verdicts: pd.DataFrame, tf_key: str, pip: float, digits: int,
-    p: IndicatorParams, risk: RiskParams, now: pd.Timestamp, label: Callable[[pd.Timestamp], str],
+    p: IndicatorParams, risk: RiskParams, now: pd.Timestamp, label: Callable[[pd.Timestamp], str], *,
+    meta: dict[str, tuple[float, str]] | None = None, meta_ok: bool = False, halt=None,
+    upcoming: list[ev.Event] | None = None,
 ) -> Commentary:
+    """meta：戦略のキー → その戦略の直近シグナルについての（勝つ確率, 乗る/見送り）。
+    upcoming：その通貨ペアに関係する予定（events.upcoming）。"""
+    meta, upcoming = meta or {}, upcoming or []
     last = ind.iloc[n_conf - 1]
     fmt = lambda x: f"{x:.{digits}f}"  # noqa: E731
-    verdict_of = dict(zip(verdicts["source"], verdicts["verdict"])) if not verdicts.empty else {}
+    vrow = {r["source"]: r for r in verdicts.to_dict("records")} if not verdicts.empty else {}
+    n_trials = max((_num(r, "n_trials") for r in vrow.values()), default=math.nan)
     alerts_of: dict[str, list[str]] = {}
     for a in alerts.itertuples():
         alerts_of.setdefault(a.source, []).append(a.message)
+    halted = halt is not None and getattr(halt, "active", False)
 
     active = [v for v in views if v.decision in ("買い", "売り")]
     buys = [v for v in active if v.decision == "買い"]
     sells = [v for v in active if v.decision == "売り"]
-    ml_used = [m for m in ml if m.ok and m.decision in ("買い", "売り")]
     score = weighted_score({v.strategy.key: v.decision for v in views}, weights)  # 重みがなければ全て1
     stance = score_label(score)
-    proven = any(verdict_of.get(v.strategy.key) == "有望（要継続監視）" for v in active) or bool(ml_used)
+    promising = [v for v in active if vrow.get(v.strategy.key, {}).get("verdict") == "有望（要継続監視）"]
+    meta_take = [v for v in active if meta_ok and meta.get(v.strategy.key, (0, ""))[1] == "乗る"]
+    meta_skip = [v for v in active if meta_ok and meta.get(v.strategy.key, (0, ""))[1] == "見送り"]
 
     # ---------------- 結論 ----------------
-    if not active and not ml_used:
+    if not active:
         headline = "様子見：いまはどの戦略からも有効なシグナルが出ていません。"
     else:
         parts = []
@@ -74,20 +106,24 @@ def build(
             parts.append(f"{'・'.join(v.strategy.name for v in buys)}が買い")
         if sells:
             parts.append(f"{'・'.join(v.strategy.name for v in sells)}が売り")
-        for m in ml_used:
-            parts.append(f"機械学習（{m.name}）が{m.decision}")
         headline = f"{stance}（重み付き総合スコア {score:+.2f}）：{'、'.join(parts)}のシグナルを出しています。"
-    if active and not proven:
-        headline += "ただし、過去の検証で優位性が確認できた手法ではないため、根拠としては弱いシグナルです。"
+        if not promising and not meta_take:
+            n_txt = "" if math.isnan(n_trials) else f"（{int(n_trials)}通り試した中での結果）"
+            headline += f"ただし、過去の検証で優位性が確認できた手法ではないため{n_txt}、根拠としては弱いシグナルです。"
+        if meta_skip:
+            headline += f"機械学習は{'・'.join(v.strategy.name for v in meta_skip)}のシグナルを「見送り」と判定しています。"
+    if halted:
+        headline = "⛔ 停止中：最大損失に達したため、新しいシグナルは出していません。" + headline
 
     # ---------------- なぜこのシグナルか ----------------
     reasons = []
     for v in active:
-        reasons.append(
-            f"**{v.strategy.name}**（{v.strategy.kind}）：{_signal_text(v.strategy.key, v.direction, p)}"
-            f"（{_when(v.bars_ago)}）→ {v.decision}。エントリー目安 {fmt(v.entry)}、"
-            f"損切り {fmt(v.sl)}（{-risk.sl_atr * v.atr / pip:.1f} pips）、利確 {fmt(v.tp)}（+{risk.tp_atr * v.atr / pip:.1f} pips）。"
-        )
+        r = (f"**{v.strategy.name}**（{v.strategy.kind}）：{_signal_text(v.strategy.key, v.direction, p)}"
+             f"（{_when(v.bars_ago)}）→ {v.decision}。エントリー目安 {fmt(v.entry)}、"
+             f"損切り {fmt(v.sl)}（{-risk.sl_atr * v.atr / pip:.1f} pips）、利確 {fmt(v.tp)}（+{risk.tp_atr * v.atr / pip:.1f} pips）。")
+        if v.strategy.key in vrow:
+            r += _evidence(vrow[v.strategy.key])
+        reasons.append(r)
 
     up_trend = last["sma_s"] > last["sma_l"]
     above_long = last["close"] > last["sma_l"]
@@ -106,19 +142,29 @@ def build(
         mom = "下向きの勢いが" + ("強まっています" if hist < prev_hist else "弱まりつつあります")
     reasons.append(f"{trend}RSIは {rsi:.0f}（{rsi_txt}）、MACDは{mom}。")
 
-    if ml:
-        ml_parts = []
-        for m in ml:
-            when = "" if m.bar_time == ind.index[n_conf - 1] else f"（{label(m.bar_time)}時点）"
-            ml_parts.append(f"{m.name}は{m.horizon}本後に上がる確率 {m.p:.0%}{when}")
-        if ml_used:
-            tail = "予測力の条件を満たしたモデルの判断を含めています。"
+    if active:
+        judged = [(v, meta[v.strategy.key]) for v in active if v.strategy.key in meta]
+        if judged:
+            txt = "、".join(f"{v.strategy.name}は「{d}」（コスト後に勝つ確率 {pr:.0%}）" for v, (pr, d) in judged)
+            tail = ("予測力の条件を満たしたモデルなので、判断に含めています。" if meta_ok
+                    else "予測力の条件を満たしていないため、参考です（判断には使っていません）。")
+            reasons.append(f"機械学習（メタラベリング：シグナルに乗るか見送るか）：{txt}。{tail}")
         else:
-            tail = "どちらも予測力が確認できていないため、判断材料にはしていません。"
-        reasons.append("機械学習：" + "、".join(ml_parts) + "。" + tail)
+            reasons.append("機械学習（メタラベリング）：このシグナルの判定はまだありません（モデルの学習より前に出たシグナルは判定しません）。")
 
     # ---------------- 注意点 ----------------
     cautions = []
+    if halted:
+        cautions.append(f"停止中：{halt.reason}。")
+    for e in [x for x in upcoming if x.importance == "high"][:2]:
+        state = ev.near(e, now)
+        when = f"日本時間 {e.jst_label()}"
+        if state == "直前":
+            cautions.append(f"まもなく{e.name}です（{when}）。発表の前後は値動きが急変し、損切りの価格を飛び越えることもあります。")
+        elif state == "直後":
+            cautions.append(f"{e.name}の直後です（{when}）。値動きが荒く、スプレッドも広がりやすい状態です。")
+        else:
+            cautions.append(f"{when} に{e.name}の予定があります。" + (e.note + "。" if e.note else ""))
     if buys and sells:
         cautions.append("戦略によって買いと売りに判断が分かれています。方向感がはっきりしない相場の可能性があります。")
     for v in active:
@@ -128,12 +174,9 @@ def build(
     for v in active:
         for msg in alerts_of.get(v.strategy.key, []):
             cautions.append(f"警告中：{msg}")
-        vd = verdict_of.get(v.strategy.key)
-        if vd in WEAK_VERDICTS:
-            cautions.append(f"{v.strategy.name}は、過去データの検証（ウォークフォワード）で「{vd}」と判定されています。")
         w = weights.get(v.strategy.key)
         if w is not None and w < 0.8:
-            cautions.append(f"{v.strategy.name}の重みは {w:.2f} と低めです（直近の成績が振るわない）。")
+            cautions.append(f"{v.strategy.name}の重みは {w:.2f} と低めです（本番の記録で成績が振るわない）。")
 
     atr_ratio = last["atr"] / ind["atr"].iloc[max(0, n_conf - 100):n_conf].mean()
     if atr_ratio >= 1.3:
@@ -147,8 +190,10 @@ def build(
         jst_now = now + JST
         if 5 <= jst_now.hour < 8:
             cautions.append("日本時間の早朝は取引量が少なく、スプレッドが広がりやすい時間帯です。")
-        elif 21 <= jst_now.hour or jst_now.hour < 1:
-            cautions.append("日本時間の21時〜翌1時ごろは米国の経済指標の発表が集中し、値動きが急に大きくなりやすい時間帯です。")
+        lows = [x for x in upcoming if x.importance == "low" and ev.near(x, now)]
+        if lows:
+            e = lows[0]
+            cautions.append(f"{e.name}（日本時間 {e.jst_label()}）の前後です。値動きが一時的に大きくなりやすい時刻です。")
         if (jst_now.dayofweek == 4 and jst_now.hour >= 20) or (jst_now.dayofweek == 5 and jst_now.hour < 7):
             cautions.append("週末をまたいでポジションを持つと、月曜の取引開始時に窓を開けて大きく動くことがあります。")
     for msg in alerts_of.get("data", []):
