@@ -5,7 +5,7 @@ import streamlit as st
 
 from dashboard import backtest_tab, ml_tab, signals_tab, tracking_tab
 from dashboard.common import JST, Context
-from fxtool import data, events, indicators, jobs, tracking
+from fxtool import data, events, indicators, jobs, tracking, trials
 from fxtool.config import (
     DAILY_MAX_LOSS_R, DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, PAIR_NAMES, PAIRS, TIMEFRAMES, WEEKLY_MAX_LOSS_R,
     IndicatorParams, RiskParams, pip_size, price_digits,
@@ -62,6 +62,7 @@ try:
     usdjpy = data.latest_close(con, "USD/JPY")
     signal_log = tracking.load_signal_log(con, pair, tf_key)
     meta_model = jobs.latest_meta(con, pair, tf_key)
+    n_trials_total = trials.count(con, pair, tf_key)
 finally:
     con.close()
 closed = signal_log[signal_log["status"].isin(tracking.DONE)]
@@ -103,6 +104,11 @@ with st.sidebar:
     )
     if boundary is not None:
         st.caption(f"🔒 **最終テスト期間**：{ctx.label(boundary.start)} 以降（検証には使いません）")
+    st.caption(
+        f"🧮 **試した組み合わせ（累計）**：{n_trials_total:,} 通り",
+        help="これまでに検証した戦略・パラメータ・モデルの設定の数です。たくさん試すほど、偶然よく見えるものが"
+             "見つかりやすくなるので、成績はこの数で割り引いて評価します（DSR）。",
+    )
     q = data.quality(raw, tf)
     with st.expander("💾 データについて"):
         gap_line = (f"週末以外の空き（祝日の休場・欠損）{q['gaps']} 回、日曜の足の時刻（UTC）{q['sunday_hours']}"

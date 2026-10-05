@@ -243,7 +243,7 @@ def render(ctx: Context) -> None:
             "検証 取引回数": len(f.test_trades),
             "検証 損益(pips)": fmt_pips(f.test_trades["pips"].sum()),
         } for i, f in enumerate(r.wf.folds)]), hide_index=True, width="stretch")
-        st.caption("パラメータの候補：" + "、".join(bt.describe_params(key, ov) for ov in bt.PARAM_GRIDS[key]))
+        st.caption("パラメータの候補：" + "、".join(bt.describe_params(key, ov) for ov in r.strategy.grid()))
 
     with st.expander("取引の一覧（開発用データ全体・初期パラメータ）"):
         key = st.selectbox("戦略", keys, format_func=name_of, key="trade_list")

@@ -17,58 +17,16 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, TransformerMixin, clone
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.inspection import permutation_importance
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
-from sklearn.pipeline import Pipeline, make_pipeline
-from sklearn.preprocessing import StandardScaler
 
 from . import backtest as bt
 from . import labeling, overfit, strategies
 from .config import IndicatorParams, RiskParams
+from .engines import LADDER, Engine, QuantileBinner  # noqa: F401（以前の場所からも参照できるように）
 from .ml import feature_label as _base_label
 from .ml import make_features
 
-class QuantileBinner(BaseEstimator, TransformerMixin):
-    """勾配ブースティングの前処理：各特徴量を、学習データの分位点（重みなし）で最大 max_bins 段階に区切る。
-
-    scikit-learn 1.9 では、サンプルの重みを渡すと勾配ブースティングの「区切りの計算」が約30倍遅くなる。
-    特徴量の値が max_bins 種類以下なら勾配ブースティングは速い計算方法を使うので、区切りをここで先に計算しておく。
-    木の学習にはサンプルの重みをそのまま使う。区切りは学習データだけから計算するので、未来の情報は混ざらない。"""
-
-    def __init__(self, max_bins: int = 255):
-        self.max_bins = max_bins
-
-    def fit(self, X, y=None):
-        X = np.asarray(X, dtype=float)
-        self.edges_ = []
-        for j in range(X.shape[1]):
-            u = np.unique(X[:, j])
-            if len(u) <= self.max_bins:
-                edges = (u[:-1] + u[1:]) / 2
-            else:  # scikit-learn（重みなし）と同じ分位点の求め方
-                qs = np.linspace(0, 100, self.max_bins + 1)[1:-1]
-                edges = np.percentile(X[:, j], qs, method="averaged_inverted_cdf")
-            self.edges_.append(edges)
-        return self
-
-    def transform(self, X):
-        # 区切り e[i-1] < x <= e[i] を i 番目の段階にする（scikit-learn と同じ向き）
-        X = np.asarray(X, dtype=float)
-        return np.column_stack([np.searchsorted(e, X[:, j], side="left") for j, e in enumerate(self.edges_)]).astype(float)
-
-
-LADDER = {
-    "logistic": ("ロジスティック回帰", make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000))),
-    # n_jobs=1：データが小さいので並列化しない方が速い（Windows では並列処理の起動・終了に毎回数秒かかっていた）
-    "rf": ("ランダムフォレスト", RandomForestClassifier(
-        n_estimators=150, max_depth=5, min_samples_leaf=50, max_features="sqrt", random_state=0, n_jobs=1)),
-    "gbm": ("勾配ブースティング", make_pipeline(QuantileBinner(), HistGradientBoostingClassifier(
-        max_depth=3, learning_rate=0.05, max_iter=200, min_samples_leaf=100, l2_regularization=1.0,
-        early_stopping=False, random_state=0))),
-}
 MODES = {"meta": "メタラベリング（おすすめ）", "direction": "方向予測（トリプルバリア）"}
 # 確信度の初期値と、DSR のばらつきの計算に使う代表的な確信度。メタラベリングは「勝つ確率」なので、
 # 利確が損切りの2倍なら約33%が損益の分かれ目になり、方向予測（50%が分かれ目）とは水準が違う
@@ -108,10 +66,8 @@ class Samples:
 
 
 def _fit(template, kind: str, X, y, w):
-    m = clone(template)
-    if isinstance(m, Pipeline):
-        return m.fit(X, y, **{f"{m.steps[-1][0]}__sample_weight": w})
-    return m.fit(X, y, sample_weight=w)
+    """学習済みの scikit-learn のモデルを返す（予測エンジンの共通の形 Engine を通す）。template は互換のため残している。"""
+    return Engine(kind).train(X, y, w).model
 
 
 def signal_events(ind: pd.DataFrame, p: IndicatorParams) -> pd.DataFrame:

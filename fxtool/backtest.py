@@ -22,17 +22,12 @@ from .strategies import Strategy, exit_hit, levels
 # ウォークフォワードのパラメータ候補で最も長い期間でも指標が計算できるよう、最初のこの本数は使わない
 WARMUP = 150
 
-PARAM_GRIDS: dict[str, list[dict]] = {
-    "ma_cross": [dict(sma_short=s, sma_long=l) for s in (10, 20, 30) for l in (50, 75, 100)],
-    "macd_cross": [dict(macd_fast=f, macd_slow=s, macd_signal=g)
-                   for f, s in ((8, 17), (12, 26), (19, 39)) for g in (5, 9)],
-    "breakout": [dict(donchian_period=n) for n in (10, 20, 40, 55)],
-    "rsi_reversal": [dict(rsi_period=n, rsi_low=lo, rsi_high=100 - lo) for n in (9, 14, 21) for lo in (20, 25, 30)],
-    "bb_reversion": [dict(bb_period=n, bb_std=s) for n in (14, 20, 30) for s in (1.5, 2.0, 2.5)],
-}
+PARAM_GRIDS = strategies.PARAM_GRIDS  # 以前の場所からも参照できるように
 
 
 def describe_params(key: str, ov: dict) -> str:
+    if not ov:
+        return "初期設定"
     if key == "ma_cross":
         return f"SMA {ov['sma_short']}/{ov['sma_long']}"
     if key == "macd_cross":
@@ -43,7 +38,7 @@ def describe_params(key: str, ov: dict) -> str:
         return f"RSI{ov['rsi_period']} {ov['rsi_low']:g}/{ov['rsi_high']:g}"
     if key == "bb_reversion":
         return f"BB {ov['bb_period']} ±{ov['bb_std']:g}σ"
-    return str(ov)
+    return "・".join(f"{k}={v:g}" if isinstance(v, (int, float)) else f"{k}={v}" for k, v in ov.items())
 
 
 @dataclass(frozen=True)
@@ -213,15 +208,17 @@ def random_walk_ohlc(ohlc: pd.DataFrame, rng: np.random.Generator) -> pd.DataFra
 
 
 def random_walk_baseline(ohlc: pd.DataFrame, base: IndicatorParams, risk: RiskParams, rules: ExitRules,
-                         costs: Costs, pip: float, paths: int = 50, seed: int = 0) -> pd.DataFrame:
+                         costs: Costs, pip: float, paths: int = 50, seed: int = 0,
+                         strategy_list: list[Strategy] | None = None) -> pd.DataFrame:
     """ランダムウォークの価格で各戦略（初期パラメータ）を動かした成績。行＝試行、列＝戦略の損益合計（pips）。"""
     rng = np.random.default_rng(seed)
+    sts = list(strategy_list) if strategy_list is not None else strategies.STRATEGIES
     rows = []
     for _ in range(paths):
         ind = indicators.add_all(random_walk_ohlc(ohlc, rng), base)
         bars = Bars(ind)
         row = {}
-        for st in strategies.STRATEGIES:
+        for st in sts:
             sig = strategies.signals(ind, st, base).tolist()
             row[st.key] = sum(t[9] for t in simulate_raw(bars, sig, risk, rules, costs, pip, WARMUP, len(ind)))
         rows.append(row)
@@ -254,7 +251,7 @@ def candidates(raw: pd.DataFrame, strategy: Strategy, base: IndicatorParams,
                cache: dict | None = None) -> list[Candidate]:
     cache = {} if cache is None else cache
     out = []
-    for ov in PARAM_GRIDS[strategy.key]:
+    for ov in strategy.grid():
         p = replace(base, **ov)
         if p not in cache:
             cache[p] = indicators.add_all(raw, p)
@@ -285,7 +282,7 @@ class Fold:
     train_metrics: dict
     test_trades: pd.DataFrame
     test_rate: float
-    candidate_metrics: list[dict] = field(default_factory=list)  # 学習区間での各候補の成績（PARAM_GRIDS の順）
+    candidate_metrics: list[dict] = field(default_factory=list)  # 学習区間での各候補の成績（Strategy.grid() の順）
 
 
 @dataclass
@@ -370,7 +367,7 @@ class Report:
 def evaluate_all(
     raw: pd.DataFrame, base: IndicatorParams, risk: RiskParams, rules: ExitRules, costs: Costs, pip: float,
     runs: int = 200, k: int = 5, train_mult: int = 2, holdout_start: pd.Timestamp | None = None,
-    rw_paths: int = 50, n_trials: int | None = None,
+    rw_paths: int = 50, n_trials: int | None = None, strategy_list: list[Strategy] | None = None,
 ) -> Report:
     """raw は開発用データ（最終テスト期間より前）。holdout_start を渡すと、それ以降の足が混ざっていたら止める。
 
@@ -387,8 +384,10 @@ def evaluate_all(
     n = len(ind)
     days = overfit.business_days(ind.index[WARMUP], ind.index[-1])
     reports, rates, grid = [], [], {}
-    rw = random_walk_baseline(raw, base, risk, rules, costs, pip, rw_paths, seed=7) if rw_paths else pd.DataFrame()
-    for i, st in enumerate(strategies.STRATEGIES):
+    sts = list(strategy_list) if strategy_list is not None else strategies.STRATEGIES
+    rw = (random_walk_baseline(raw, base, risk, rules, costs, pip, rw_paths, seed=7, strategy_list=sts)
+          if rw_paths else pd.DataFrame())
+    for i, st in enumerate(sts):
         sig = strategies.signals(ind, st, base).tolist()
         full = simulate(bars, sig, risk, rules, costs, pip, WARMUP, n)
         fm = metrics(full["pips"])
@@ -449,12 +448,15 @@ def finalize(rep: Report, n_trials: int) -> Report:
     return rep
 
 
-def planned_trials(base: IndicatorParams, risk: RiskParams, rules: ExitRules) -> list[dict]:
-    """evaluate_all が試す設定（全戦略のパラメータ候補。初期パラメータも候補に含まれる）。"""
+def planned_trials(base: IndicatorParams, risk: RiskParams, rules: ExitRules,
+                   strategy_list: list[Strategy] | None = None) -> list[dict]:
+    """evaluate_all が試す設定（各戦略のパラメータ候補。初期パラメータも候補に含まれる）。"""
     from .trials import strategy_config
 
-    return [{"family": "strategy", "name": key, "config": strategy_config(key, replace(base, **ov), risk, rules)}
-            for key, grid in PARAM_GRIDS.items() for ov in grid]
+    sts = list(strategy_list) if strategy_list is not None else strategies.STRATEGIES
+    return [{"family": "strategy", "name": st.key,
+             "config": strategy_config(st.key, replace(base, **ov), risk, rules, spec=st.spec)}
+            for st in sts for ov in st.grid()]
 
 
 def trial_rows(reports: list[StrategyReport], base: IndicatorParams, risk: RiskParams, rules: ExitRules) -> list[dict]:
@@ -463,13 +465,13 @@ def trial_rows(reports: list[StrategyReport], base: IndicatorParams, risk: RiskP
 
     rows = []
     for r in reports:
-        key = r.strategy.key
-        rows.append({"family": "strategy", "name": key, "purpose": "full_period",
-                     "config": strategy_config(key, base, risk, rules),
+        st = r.strategy
+        rows.append({"family": "strategy", "name": st.key, "purpose": "full_period",
+                     "config": strategy_config(st.key, base, risk, rules, spec=st.spec),
                      "metrics": {**r.full_metrics, "beat_random": r.full_beat}})
-        for j, ov in enumerate(PARAM_GRIDS[key]):
-            rows.append({"family": "strategy", "name": key, "purpose": "wf_candidate",
-                         "config": strategy_config(key, replace(base, **ov), risk, rules),
+        for j, ov in enumerate(st.grid()):
+            rows.append({"family": "strategy", "name": st.key, "purpose": "wf_candidate",
+                         "config": strategy_config(st.key, replace(base, **ov), risk, rules, spec=st.spec),
                          "metrics": {"train_total_by_fold": [f.candidate_metrics[j]["total"] for f in r.wf.folds],
                                      "selected_folds": [i for i, f in enumerate(r.wf.folds) if f.overrides == ov]}})
     return rows

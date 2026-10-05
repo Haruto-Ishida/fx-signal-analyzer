@@ -20,10 +20,15 @@ RETRO_NOTE = ("研究ノート反映前の試行（会話の記録から再構�
               "このほかに、画面の検証タブで手動で試した設定がある可能性がある（記録なし）。")
 
 
-def strategy_config(key: str, params: IndicatorParams, risk: RiskParams, rules) -> dict:
-    return {"strategy": key, "params": asdict(params),
-            "risk": {"sl_atr": risk.sl_atr, "tp_atr": risk.tp_atr},
-            "rules": {"opposite_exit": rules.opposite_exit, "max_bars": rules.max_bars}}
+def strategy_config(key: str, params: IndicatorParams, risk: RiskParams, rules, spec: dict | None = None) -> dict:
+    """spec は、有名手法や GA の戦略を再現するための情報（遺伝子など）。最初からある5つの戦略では空で、
+    そのときは以前と同じ形（＝同じハッシュ）になる。"""
+    cfg = {"strategy": key, "params": asdict(params),
+           "risk": {"sl_atr": risk.sl_atr, "tp_atr": risk.tp_atr},
+           "rules": {"opposite_exit": rules.opposite_exit, "max_bars": rules.max_bars}}
+    if spec:
+        cfg["spec"] = spec
+    return cfg
 
 
 def ml_config(kind: str, horizon: int, threshold: float, label: str = "direction", features: str = "v1",

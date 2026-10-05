@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
@@ -56,24 +56,51 @@ def bb_reversion(d: pd.DataFrame, p: IndicatorParams) -> pd.Series:
 
 @dataclass(frozen=True)
 class Strategy:
+    """戦略の共通の形（要件定義書 4章の4）。最初からある5つの戦略・有名手法・GA が作った戦略を、同じ形で扱う。
+
+    func(ind, p) は、指標付きのデータ ind（open/high/low/close と indicators.add_all の列）から、
+    各足のシグナル（+1 買い / −1 売り / 0 なし）を、その足までのデータだけで計算する。
+    """
     key: str
     name: str
-    kind: str
-    rule: str
+    kind: str                     # 順張り / 逆張り など
+    rule: str                     # ルールの説明（初心者向けの日本語）
     func: Callable[[pd.DataFrame, IndicatorParams], pd.Series]
+    family: str = "builtin"       # builtin（最初からある5つ）/ famous（有名手法）/ ga（GA が作ったもの）
+    source: str = ""              # 考案者・出典（有名手法）や、GA の探索の記録
+    param_grid: tuple = ()        # ウォークフォワードで試すパラメータの候補（IndicatorParams を上書きする dict）。空なら初期値だけ
+    spec: dict = field(default_factory=dict, compare=False, hash=False)  # ルールを再現するための情報（試行記録に残す）
 
+    def grid(self) -> list[dict]:
+        return list(self.param_grid) or [{}]
+
+
+# 最初からある5つの戦略のパラメータ候補（ウォークフォワードで、学習区間ごとに最も良いものを選ぶ）
+PARAM_GRIDS: dict[str, list[dict]] = {
+    "ma_cross": [dict(sma_short=s, sma_long=l) for s in (10, 20, 30) for l in (50, 75, 100)],
+    "macd_cross": [dict(macd_fast=f, macd_slow=s, macd_signal=g)
+                   for f, s in ((8, 17), (12, 26), (19, 39)) for g in (5, 9)],
+    "breakout": [dict(donchian_period=n) for n in (10, 20, 40, 55)],
+    "rsi_reversal": [dict(rsi_period=n, rsi_low=lo, rsi_high=100 - lo) for n in (9, 14, 21) for lo in (20, 25, 30)],
+    "bb_reversion": [dict(bb_period=n, bb_std=s) for n in (14, 20, 30) for s in (1.5, 2.0, 2.5)],
+}
 
 STRATEGIES = [
     Strategy("ma_cross", "移動平均クロス", "順張り",
-             "短期SMAが長期SMAを上抜けで買い（ゴールデンクロス）、下抜けで売り（デッドクロス）", ma_cross),
+             "短期SMAが長期SMAを上抜けで買い（ゴールデンクロス）、下抜けで売り（デッドクロス）", ma_cross,
+             param_grid=tuple(PARAM_GRIDS["ma_cross"])),
     Strategy("macd_cross", "MACDクロス", "順張り",
-             "MACDがシグナル線を上抜けで買い、下抜けで売り", macd_cross),
+             "MACDがシグナル線を上抜けで買い、下抜けで売り", macd_cross,
+             param_grid=tuple(PARAM_GRIDS["macd_cross"])),
     Strategy("breakout", "ブレイクアウト", "順張り",
-             "終値が直前N本の最高値を超えたら買い、最安値を割ったら売り（ドンチャンチャネル）", breakout),
+             "終値が直前N本の最高値を超えたら買い、最安値を割ったら売り（ドンチャンチャネル）", breakout,
+             param_grid=tuple(PARAM_GRIDS["breakout"])),
     Strategy("rsi_reversal", "RSI反転", "逆張り",
-             "RSIが売られすぎラインを下から回復で買い、買われすぎラインを上から割り込みで売り", rsi_reversal),
+             "RSIが売られすぎラインを下から回復で買い、買われすぎラインを上から割り込みで売り", rsi_reversal,
+             param_grid=tuple(PARAM_GRIDS["rsi_reversal"])),
     Strategy("bb_reversion", "ボリンジャー回帰", "逆張り",
-             "終値が−σの外からバンド内に戻ったら買い、+σの外から戻ったら売り", bb_reversion),
+             "終値が−σの外からバンド内に戻ったら買い、+σの外から戻ったら売り", bb_reversion,
+             param_grid=tuple(PARAM_GRIDS["bb_reversion"])),
 ]
 STRATEGY_BY_KEY = {s.key: s for s in STRATEGIES}
 
