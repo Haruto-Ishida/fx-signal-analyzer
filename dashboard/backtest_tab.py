@@ -1,6 +1,8 @@
 """タブ「バックテスト」（フェーズ2）。"""
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -11,21 +13,33 @@ from fxtool.config import DEFAULT_SLIPPAGE, DEFAULT_SPREAD, IndicatorParams, Ris
 
 from .common import NEUTRAL_COLOR, STRATEGY_COLORS, Context, fmt_pct, fmt_pf, fmt_pips
 
-VERDICT_ICONS = {"有望（要継続監視）": "🟢", "偶然の範囲": "🟡", "不安定": "🟡", "優位性なし": "🔴", "判断材料不足": "⚪"}
+VERDICT_ICONS = {"有望（要継続監視）": "🟢", "偶然の範囲": "🟡", "不安定": "🟡", "偶然の可能性": "🟡",
+                 "過学習の疑い": "🟠", "参考値": "⚪", "優位性なし": "🔴", "判断材料不足": "⚪"}
 
 
 @st.cache_data(show_spinner=False, max_entries=6)
 def run(pair: str, tf_key: str, ohlc: pd.DataFrame, params: IndicatorParams, risk: RiskParams, rules: bt.ExitRules,
         costs: bt.Costs, pip: float, runs: int, k: int, train_mult: int, holdout_start: pd.Timestamp) -> bt.Report:
-    """開発用データだけで評価し、試した組み合わせを記録する（同じ設定はキャッシュされ、二重に記録しない）。"""
+    """開発用データだけで評価し、試した組み合わせを記録してから、記録済みの試行すべての数で DSR を割り引く
+    （同じ設定はキャッシュされ、二重に記録しない）。"""
     rep = bt.evaluate_all(ohlc, params, risk, rules, costs, pip, runs, k, train_mult, holdout_start=holdout_start)
     con = data.connect()
     try:
         trials.record(con, rep.trials, pair=pair, tf=tf_key, origin="dashboard", now=data.now_utc(),
                       data_from=ohlc.index[0], data_to=ohlc.index[-1], n_bars=len(ohlc))
+        rep = bt.finalize(rep, trials.count(con, pair, tf_key))
     finally:
         con.close()
     return rep
+
+
+def ref(n: int, text: str) -> str:
+    """取引が少ない（研究ノート5：100回未満）成績には「参考値」と付ける。"""
+    return f"{text}（参考値）" if n < bt.MIN_TRADES_RELIABLE else text
+
+
+def fmt_ratio(x: float) -> str:
+    return "—" if math.isnan(x) else f"{x:.2f}"
 
 
 def holdout_notice(ctx: Context) -> None:
@@ -47,16 +61,19 @@ def holdout_notice(ctx: Context) -> None:
     )
 
 
-def metric_row(name: str, m: dict, beat: str = "—") -> dict:
+def metric_row(name: str, m: dict, beat: str = "—", sharpe: float = math.nan, rw: str = "—") -> dict:
     return {
         "戦略": name,
-        "取引回数": f"{m['n']:,}",
+        "取引回数": ref(m["n"], f"{m['n']:,}") if m["n"] else "0",
         "勝率": fmt_pct(m["win_rate"]),
         "損益合計(pips)": fmt_pips(m["total"]),
         "平均(pips/回)": fmt_pips(m["avg"]),
+        "平均利益/平均損失": fmt_ratio(m.get("payoff", math.nan)),
         "PF": fmt_pf(m["pf"]),
+        "シャープレシオ(年率)": fmt_ratio(sharpe),
         "最大DD(pips)": fmt_pips(m["max_dd"]),
-        "ランダムを上回った割合": beat,
+        "ランダム売買を上回った割合": beat,
+        "ランダムウォークを上回った割合": rw,
     }
 
 
@@ -118,8 +135,10 @@ def render(ctx: Context) -> None:
 
     # ---------------- 開発用データ全体 ----------------
     st.markdown(f"### ① 開発用データ全体の成績（初期パラメータ）　{ctx.label(conf.index[rep.start])} 〜 {ctx.label(conf.index[-1])}")
-    rows = [metric_row(r.strategy.name, r.full_metrics, fmt_pct(r.full_beat)) for r in rep.reports]
-    rows.append(metric_row("何もしない", bt.metrics([])) | {"損益合計(pips)": "±0.0", "最大DD(pips)": "±0.0"})
+    rows = [metric_row(r.strategy.name, r.full_metrics, fmt_pct(r.full_beat), r.full_sharpe, fmt_pct(r.rw_beat))
+            for r in rep.reports]
+    rows.append(metric_row("何もしない", bt.metrics([]), sharpe=0.0)
+                | {"損益合計(pips)": "±0.0", "最大DD(pips)": "±0.0"})
     b = rep.baseline_random
     rows.append({
         "戦略": "ランダム売買（中央値）",
@@ -127,15 +146,21 @@ def render(ctx: Context) -> None:
         "勝率": fmt_pct(b["win_rate"].median()),
         "損益合計(pips)": fmt_pips(b["total"].median()),
         "平均(pips/回)": fmt_pips(b["avg"].median()),
+        "平均利益/平均損失": fmt_ratio(b["payoff"].median()),
         "PF": fmt_pf(b["pf"].median()),
+        "シャープレシオ(年率)": "—",
         "最大DD(pips)": fmt_pips(b["max_dd"].median()),
-        "ランダムを上回った割合": "50%",
+        "ランダム売買を上回った割合": "50%",
+        "ランダムウォークを上回った割合": "—",
     })
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     st.caption(
-        "「ランダムを上回った割合」は、その戦略と同じ頻度でランダムに売買した試行（決済ルール・コストは同じ）のうち、"
-        "損益合計で上回った割合です。95%以上なら偶然では出にくい成績と言えます。"
-        "なお、初期パラメータは一般的によく使われる値ですが、過去のデータを見たうえでの結果なので、実力より良く見えている可能性があります。"
+        "「ランダム売買を上回った割合」は、その戦略と同じ頻度でランダムに売買した試行（決済ルール・コストは同じ）のうち、"
+        "損益合計で上回った割合です。「ランダムウォークを上回った割合」は、本物の値動きの順番をバラバラに並べ替えた価格"
+        f"（値動きの大きさは同じで、流れやパターンがない価格）{len(rep.random_walk)}通りで同じ戦略を動かした成績のうち、"
+        "上回った割合です。どちらも95%以上なら偶然では出にくい成績と言えます。"
+        "シャープレシオは日ごとの損益の 平均 ÷ ばらつき を年率にしたもので、リスクの割にどれだけ稼げたかを表します。"
+        f"取引が{bt.MIN_TRADES_RELIABLE}回未満の成績は「参考値」です。"
     )
 
     fig = go.Figure()
@@ -169,13 +194,15 @@ def render(ctx: Context) -> None:
             "評価": f"{VERDICT_ICONS[r.verdict[0]]} {r.verdict[0]}",
             "学習区間の平均(pips/回)": fmt_pips(r.wf.train_avg),
             "検証区間の平均(pips/回)": fmt_pips(m["avg"]),
-            "検証 取引回数": f"{m['n']:,}",
+            "検証 取引回数": ref(m["n"], f"{m['n']:,}"),
             "検証 勝率": fmt_pct(m["win_rate"]),
             "検証 損益合計(pips)": fmt_pips(m["total"]),
+            "検証 平均利益/平均損失": fmt_ratio(m["payoff"]),
             "検証 PF": fmt_pf(m["pf"]),
+            "検証 シャープレシオ(年率)": fmt_ratio(r.wf_sharpe),
             "検証 最大DD(pips)": fmt_pips(m["max_dd"]),
             "黒字の区間": f"{r.wf.positive_folds}/{k}",
-            "ランダムを上回った割合": fmt_pct(r.wf_beat),
+            "ランダム売買を上回った割合": fmt_pct(r.wf_beat),
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     st.caption("学習区間どうしは重なっているため、合計ではなく1取引あたりの平均で比べています。")
@@ -195,6 +222,9 @@ def render(ctx: Context) -> None:
     fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="検証区間の累積損益（pips）",
                       hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.05, x=0))
     st.plotly_chart(fig, width="stretch")
+
+    render_yearly(ctx, rep, conf)
+    render_overfit(rep)
 
     keys = [r.strategy.key for r in rep.reports]
     by_key = {r.strategy.key: r for r in rep.reports}
@@ -237,10 +267,94 @@ def render(ctx: Context) -> None:
     with st.expander("📘 指標の意味と、この検証の限界"):
         st.markdown(
             "- **勝率**：利益が出た取引の割合。損切りより利確の幅を広くしているので、勝率が50%を下回っても利益が出ることがあります。\n"
+            "- **平均利益/平均損失**：勝った1回の平均の大きさ ÷ 負けた1回の平均の大きさ。勝率とあわせて見ます。\n"
             "- **PF（プロフィットファクター）**：総利益 ÷ 総損失。1を超えればプラス。1.0〜1.1程度はコストや偶然で簡単に変わる水準です。\n"
+            "- **シャープレシオ（年率）**：日ごとの損益の 平均 ÷ ばらつき × √252。損益の安定度の目安で、1を超えると良好とされますが、"
+            "試した数が多いと偶然でも高い値が出ます（④で割り引きます）。\n"
             "- **最大DD（ドローダウン）**：累積損益のピークからの最大の落ち込み（決済ベース）。実際に耐える必要があった含み損の目安です。\n"
-            "- **売買の前提**：シグナルの次の足の始値でエントリー。1本の足の中で損切りと利確の両方に届いた場合は損切りとみなします。"
+            f"- **参考値**：取引が{bt.MIN_TRADES_RELIABLE}回未満の成績。偶然の影響が大きいので、判定でも「有望」にはしません。\n"
+            "- **売買の前提**：シグナルの次の足の始値でエントリー。決済は利確・損切り・時間切れのうち先に来たもの（トリプルバリア）。"
+            "1本の足の中で損切りと利確の両方に届いた場合は損切りとみなします。"
             "足の中の細かい値動きはわからないため、損切り・利確はちょうどその価格で約定したと仮定しています（急変時のずれは考慮していません）。\n"
-            "- **複数の戦略を同時に試している**ので、そのうち1つが偶然よく見えることは起こりえます。"
-            "「有望」と出た戦略も、フェーズ4の継続的な記録で成績を確かめていく必要があります。"
+            "- **最終テスト期間は使っていません。** ここで良い成績でも、最終的な実力は本番の記録で確かめます。"
         )
+
+
+def render_yearly(ctx: Context, rep: bt.Report, conf: pd.DataFrame) -> None:
+    """③ 年ごとの成績（研究ノート 1-2：期間ごとに分けて、直近の劣化を確認する）。"""
+    st.markdown("### ③ 年ごとの成績（開発用データ全体・初期パラメータ）")
+    table = {}
+    for r in rep.reports:
+        y = r.yearly_full.set_index("year") if len(r.yearly_full) else pd.DataFrame(columns=["n", "total"])
+        table[r.strategy.name] = {yr: f"{row.total:+,.0f}（{int(row.n)}回）" for yr, row in y.iterrows()}
+    df = pd.DataFrame(table)
+    df.index.name = "年"
+    st.dataframe(df.sort_index(ascending=False), width="stretch")
+
+    # 直近1年（開発用データの最後の365日）と、それより前の1年あたりの平均を比べる
+    end = conf.index[-1]
+    cut = end - pd.Timedelta(days=365)
+    notes = []
+    for r in rep.reports:
+        t = r.full_trades
+        if t.empty:
+            continue
+        exits = conf.index[t["exit_i"].to_numpy(dtype=int)]
+        recent = t["pips"][exits > cut].sum()
+        before = t["pips"][exits <= cut]
+        years_before = max((cut - conf.index[rep.start]).days / 365, 0)
+        if years_before < 0.5:
+            continue
+        per_year = before.sum() / years_before
+        if recent < 0 and recent < per_year:
+            notes.append(f"**{r.strategy.name}**：直近1年 {recent:+,.0f} pips（それより前は1年あたり {per_year:+,.0f} pips）")
+    if notes:
+        st.warning("📉 直近1年の成績が、それより前より悪化している戦略：  \n" + "  \n".join(notes))
+    else:
+        st.caption("直近1年（開発用データの最後の365日）の成績が、それより前の1年あたりの平均より悪化した戦略はありません。")
+    st.caption(
+        f"年は決済した日で区切っています。開発用データの最後（{ctx.label(end)}）より後は最終テスト期間なので含みません。"
+        "研究ノートにあるとおり、効いていた手法も時間とともに効かなくなることがあるので、全期間の合計だけで判断しないでください。"
+    )
+
+
+def render_overfit(rep: bt.Report) -> None:
+    """④ 過学習のチェック（研究ノート 2-3：PBO と Deflated Sharpe Ratio）。"""
+    st.markdown("### ④ 過学習のチェック（たくさん試した中から選んだ「まぐれ」ではないか）")
+    pa = rep.pbo_all
+    c1, c2, c3 = st.columns(3)
+    c1.metric("試した組み合わせの数", f"{rep.n_trials} 通り", help="記録済みの試行すべて（研究ノート反映前の推定分を含む）。")
+    c2.metric("PBO（全候補）", "—" if math.isnan(pa.get("pbo", math.nan)) else f"{pa['pbo']:.0%}",
+              help="過去に一番良かった設定が、別の期間では中位より下に落ちる確率。50%前後なら、選んでも意味がない状態。")
+    bd = rep.best_dsr
+    c3.metric("最良の候補の DSR", "—" if not bd or math.isnan(bd.get("dsr", math.nan)) else f"{bd['dsr']:.0%}",
+              help="開発用データ全体でシャープレシオが一番高かった候補が、試した数で割り引いても偶然ではない確率。95%以上が目安。")
+    if bd:
+        st.markdown(
+            f"- 全{pa['n_configs']}候補のうち、シャープレシオが一番高かったのは **{rep.best_config.replace('|', '・')}**"
+            f"（年率 {bd['sr_annual']:.2f}）。ただし、{rep.n_trials}通り試せば、どれも実力がゼロでも"
+            f"**年率 {bd['sr_star_annual']:.2f} 程度は偶然で出る**計算です。それを上回っている確率（DSR）は **{bd['dsr']:.0%}** です。\n"
+            f"- PBO の計算では、開発用データを{pa['n_splits']}区間に分け、半分の区間で一番良かった候補が残り半分で何位になるかを"
+            f"{len(pa['logits']):,}通りの分け方で調べました。一番良かった候補が、残り半分でマイナスになった割合は"
+            f" **{pa['prob_oos_loss']:.0%}** です。"
+        )
+    rows = []
+    for r in rep.reports:
+        d = r.dsr
+        rows.append({
+            "戦略": r.strategy.name,
+            "検証区間のシャープレシオ(年率)": fmt_ratio(d.get("sr_annual", math.nan)),
+            "偶然でも出る水準(年率)": fmt_ratio(d.get("sr_star_annual", math.nan)),
+            "DSR（偶然ではない確率）": fmt_pct(d.get("dsr", math.nan)),
+            "パラメータ候補の数": r.pbo.get("n_configs", 0),
+            "PBO（パラメータ選びの過学習の確率）": fmt_pct(r.pbo.get("pbo", math.nan)),
+            "評価": f"{VERDICT_ICONS[r.verdict[0]]} {r.verdict[0]}",
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption(
+        "DSR（Deflated Sharpe Ratio）は、試した組み合わせの数と、損益の分布のゆがみ・裾の厚さを考慮してシャープレシオを割り引き、"
+        "「本当の実力がプラスである確率」を出したものです（Bailey & López de Prado, 2014）。"
+        "PBO（Probability of Backtest Overfitting）は、パラメータ選びが過学習している確率です（Bailey ほか, 2017）。"
+        "「有望」の判定には、DSR 95%以上と PBO 50%未満が必要です。"
+        "なお、DSR の「試した数」には、研究ノート反映前の推定分と機械学習の設定も含めています（厳しめの数え方）。"
+    )

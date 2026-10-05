@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS backtest_verdicts (
     pair TEXT NOT NULL, tf TEXT NOT NULL, source TEXT NOT NULL,
     computed_at TEXT NOT NULL, bar_time TEXT NOT NULL,
     verdict TEXT NOT NULL, reason TEXT NOT NULL, wf_total REAL, wf_beat REAL,
+    dsr REAL, pbo REAL, n_trials INTEGER, wf_n INTEGER,
     PRIMARY KEY (pair, tf, source)
 );
 CREATE TABLE IF NOT EXISTS log_state (
@@ -122,6 +123,10 @@ def migrate(con: sqlite3.Connection) -> None:
     for c in ("eval_from", "eval_to", "train_from"):
         if c not in reg_cols:
             con.execute(f"ALTER TABLE model_registry ADD COLUMN {c} TEXT")
+    ver_cols = _columns(con, "backtest_verdicts")
+    for c, typ in (("dsr", "REAL"), ("pbo", "REAL"), ("n_trials", "INTEGER"), ("wf_n", "INTEGER")):
+        if c not in ver_cols:
+            con.execute(f"ALTER TABLE backtest_verdicts ADD COLUMN {c} {typ}")
     from .trials import seed_retroactive
     seed_retroactive(con)
     con.commit()
@@ -370,7 +375,7 @@ def load_weight_history(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataF
 def load_verdicts(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
     df = pd.read_sql_query("SELECT * FROM backtest_verdicts WHERE pair=? AND tf=?", con, params=(pair, tf),
                            parse_dates=["computed_at", "bar_time"])
-    return _numeric(df, ["wf_total", "wf_beat"])
+    return _numeric(df, ["wf_total", "wf_beat", "dsr", "pbo", "n_trials", "wf_n"])
 
 
 @dataclass

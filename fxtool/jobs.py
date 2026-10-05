@@ -304,23 +304,32 @@ def exit_rules(tf_key: str) -> bt.ExitRules:
 
 
 def verdicts_due(con, pair, tf_key, ind_dev) -> bool:
-    """開発用データ（境界で固定）の最後の足で計算した判定がまだなければ計算する。"""
-    have = con.execute("SELECT COUNT(*) FROM backtest_verdicts WHERE pair=? AND tf=? AND bar_time=?",
-                       (pair, tf_key, ts_str(ind_dev.index[-1]))).fetchone()[0]
+    """開発用データ（境界で固定）の最後の足で、DSR・PBO まで計算した判定がまだなければ計算する。"""
+    have = con.execute(
+        "SELECT COUNT(*) FROM backtest_verdicts WHERE pair=? AND tf=? AND bar_time=? AND n_trials IS NOT NULL",
+        (pair, tf_key, ts_str(ind_dev.index[-1]))).fetchone()[0]
     return have < len(strategies.STRATEGIES)
 
 
 def save_verdicts(con, pair, tf_key, dev: pd.DataFrame, b, costs, pip, now) -> None:
     """フェーズ2の評価（初期設定）を開発用データだけで行い、戦略ごとの判定を保存する（相場の解説で使う）。"""
     rep = bt.evaluate_all(dev[["open", "high", "low", "close"]], P, RISK, exit_rules(tf_key), costs, pip, runs=100,
-                          holdout_start=b.start)
-    con.executemany(
-        "INSERT OR REPLACE INTO backtest_verdicts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [(pair, tf_key, r.strategy.key, ts_str(now), ts_str(dev.index[-1]), r.verdict[0], r.verdict[1],
-          r.wf.test_metrics["total"], r.wf_beat) for r in rep.reports],
-    )
+                          holdout_start=b.start, rw_paths=20)
     trials.record(con, rep.trials, pair=pair, tf=tf_key, origin="job", now=now,
                   data_from=dev.index[0], data_to=dev.index[-1], n_bars=len(dev))
+    rep = bt.finalize(rep, trials.count(con, pair, tf_key))  # 記録済みの試行すべてで DSR を割り引く
+    con.executemany(
+        """INSERT OR REPLACE INTO backtest_verdicts
+           (pair, tf, source, computed_at, bar_time, verdict, reason, wf_total, wf_beat, dsr, pbo, n_trials, wf_n)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(pair, tf_key, r.strategy.key, ts_str(now), ts_str(dev.index[-1]), r.verdict[0], r.verdict[1],
+          r.wf.test_metrics["total"], r.wf_beat, _num(r.dsr.get("dsr")), _num(r.pbo.get("pbo")), rep.n_trials,
+          r.wf.test_metrics["n"]) for r in rep.reports],
+    )
+
+
+def _num(x) -> float | None:
+    return None if x is None or (isinstance(x, float) and math.isnan(x)) else float(x)
 
 
 def resolve_signals(con, pair, tf_key, ind, costs, pip) -> int:

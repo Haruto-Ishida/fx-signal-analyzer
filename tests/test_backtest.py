@@ -154,6 +154,7 @@ def test_assess_labels():
         return bt.WalkForwardResult([], pd.DataFrame(), dict(n=n, total=total), 0.0, pos)
     assert bt.assess(fake(100, 5, 5), 0.99, 5)[0] == "判断材料不足"
     assert bt.assess(fake(-1, 50, 2), 0.99, 5)[0] == "優位性なし"
-    assert bt.assess(fake(100, 50, 4), 0.97, 5)[0] == "有望（要継続監視）"
+    assert bt.assess(fake(100, 150, 4), 0.97, 5, dsr=0.99, pbo=0.1)[0] == "有望（要継続監視）"
+    assert bt.assess(fake(100, 50, 4), 0.97, 5, dsr=0.99, pbo=0.1)[0] == "参考値"  # 取引100回未満
     assert bt.assess(fake(100, 50, 1), 0.97, 5)[0] == "不安定"
     assert bt.assess(fake(100, 50, 4), 0.60, 5)[0] == "偶然の範囲"

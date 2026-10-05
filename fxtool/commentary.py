@@ -15,7 +15,7 @@ from .strategies import StrategyView
 from .tracking import MLStatus, score_label, weighted_score
 
 JST = pd.Timedelta(hours=9)
-WEAK_VERDICTS = {"優位性なし", "偶然の範囲", "不安定", "判断材料不足"}
+WEAK_VERDICTS = {"優位性なし", "偶然の範囲", "不安定", "判断材料不足", "参考値", "偶然の可能性", "過学習の疑い"}
 MAX_CAUTIONS = 6
 NEWS_CAVEAT = ("経済指標の発表やニュース（要人発言・金融政策・地政学リスクなど）は考慮していません。"
                "発表の前後は値動きが急変し、損切りの価格を飛び越えることもあります。")

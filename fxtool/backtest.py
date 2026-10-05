@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 import pandas as pd
 
-from . import indicators, strategies
+from . import indicators, overfit, strategies
 from .config import IndicatorParams, RiskParams
 from .strategies import Strategy, exit_hit, levels
 
@@ -129,7 +129,8 @@ def metrics(pips) -> dict:
     p = np.asarray(pips, dtype=float)
     n = len(p)
     if n == 0:
-        return dict(n=0, win_rate=math.nan, total=0.0, avg=math.nan, pf=math.nan, max_dd=0.0)
+        return dict(n=0, win_rate=math.nan, total=0.0, avg=math.nan, pf=math.nan, max_dd=0.0,
+                    avg_win=math.nan, avg_loss=math.nan, payoff=math.nan)
     gross_win = p[p > 0].sum()
     gross_loss = -p[p < 0].sum()
     if gross_loss > 0:
@@ -138,10 +139,17 @@ def metrics(pips) -> dict:
         pf = math.inf if gross_win > 0 else math.nan
     eq = np.cumsum(p)
     peak = np.maximum.accumulate(np.maximum(eq, 0))  # 開始時点（0）もピークに含める
+    avg_win = float(p[p > 0].mean()) if (p > 0).any() else math.nan
+    avg_loss = float(p[p < 0].mean()) if (p < 0).any() else math.nan
     return dict(
         n=n, win_rate=float((p > 0).mean()), total=float(eq[-1]), avg=float(p.mean()),
         pf=float(pf), max_dd=float(min(0.0, (eq - peak).min())),
+        avg_win=avg_win, avg_loss=avg_loss,
+        payoff=avg_win / -avg_loss if not (math.isnan(avg_win) or math.isnan(avg_loss)) else math.nan,
     )
+
+
+MIN_TRADES_RELIABLE = 100  # 研究ノート5：これ未満の取引回数の成績は「参考値」
 
 
 def equity_curve(exit_i, pips, n: int) -> np.ndarray:
@@ -185,6 +193,51 @@ def random_baseline(
 def beat_ratio(value: float, random_totals: pd.Series) -> float:
     """ランダム売買の試行のうち、value が上回った割合（0〜1）。"""
     return float((random_totals < value).mean())
+
+
+# ---------------- ランダムウォーク（研究ノート 1-1） ----------------
+
+def random_walk_ohlc(ohlc: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    """値動きの順番だけをランダムに並べ替えた価格。1本ごとの形（窓・高値・安値・終値の動き）と
+    値動きの大きさの分布はそのままで、流れ（トレンド・パターン）だけがなくなる。時刻はそのまま。"""
+    o, h, l, c = (ohlc[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
+    prev_close = np.r_[o[0], c[:-1]]
+    gap, up, down, body = o - prev_close, h - o, l - o, c - o
+    order = rng.permutation(np.arange(1, len(ohlc)))
+    order = np.r_[0, order]
+    gap, up, down, body = gap[order], up[order], down[order], body[order]
+    gap[0] = 0.0
+    close = o[0] + np.cumsum(gap + body)
+    open_ = close - body
+    return pd.DataFrame({"open": open_, "high": open_ + up, "low": open_ + down, "close": close}, index=ohlc.index)
+
+
+def random_walk_baseline(ohlc: pd.DataFrame, base: IndicatorParams, risk: RiskParams, rules: ExitRules,
+                         costs: Costs, pip: float, paths: int = 50, seed: int = 0) -> pd.DataFrame:
+    """ランダムウォークの価格で各戦略（初期パラメータ）を動かした成績。行＝試行、列＝戦略の損益合計（pips）。"""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for _ in range(paths):
+        ind = indicators.add_all(random_walk_ohlc(ohlc, rng), base)
+        bars = Bars(ind)
+        row = {}
+        for st in strategies.STRATEGIES:
+            sig = strategies.signals(ind, st, base).tolist()
+            row[st.key] = sum(t[9] for t in simulate_raw(bars, sig, risk, rules, costs, pip, WARMUP, len(ind)))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def yearly(trades: pd.DataFrame, index: pd.Index) -> pd.DataFrame:
+    """決済した年ごとの成績。"""
+    if trades.empty:
+        return pd.DataFrame(columns=["year", "n", "total", "pf"])
+    years = pd.DatetimeIndex(index[trades["exit_i"].to_numpy(dtype=int)]).year
+    out = []
+    for y, g in trades.groupby(years):
+        m = metrics(g["pips"])
+        out.append({"year": int(y), "n": m["n"], "total": m["total"], "pf": m["pf"]})
+    return pd.DataFrame(out)
 
 
 # ---------------- ウォークフォワード ----------------
@@ -278,7 +331,7 @@ def walk_forward(
 @dataclass
 class StrategyReport:
     strategy: Strategy
-    full_trades: pd.DataFrame        # 全期間・初期パラメータ
+    full_trades: pd.DataFrame        # 開発用データ全体・初期パラメータ
     full_metrics: dict
     full_random: pd.DataFrame        # 同じ頻度のランダム売買（試行ごとの成績）
     full_beat: float
@@ -286,6 +339,15 @@ class StrategyReport:
     wf_random: pd.DataFrame          # 検証区間だけで、同じ頻度のランダム売買
     wf_beat: float
     verdict: tuple[str, str]
+    full_daily: pd.Series = None     # 日ごとの損益（開発用データ全体・初期パラメータ）
+    wf_daily: pd.Series = None       # 日ごとの損益（ウォークフォワードの検証区間）
+    full_sharpe: float = math.nan    # 年率
+    wf_sharpe: float = math.nan      # 年率
+    rw_beat: float = math.nan        # ランダムウォークの価格での成績を上回った割合
+    yearly_full: pd.DataFrame = None
+    yearly_wf: pd.DataFrame = None
+    dsr: dict = field(default_factory=dict)   # 検証区間の日ごとの損益にもとづく DSR
+    pbo: dict = field(default_factory=dict)   # この戦略のパラメータ候補だけでの PBO
 
 
 @dataclass
@@ -296,13 +358,25 @@ class Report:
     baseline_curves: np.ndarray      # その累積損益の 5/50/95% 点
     k: int
     trials: list[dict] = field(default_factory=list)  # 試行の記録用（trials.record に渡す）
+    grid_daily: pd.DataFrame = None  # 全パラメータ候補の日ごとの損益（列＝"戦略|パラメータ"）
+    random_walk: pd.DataFrame = None  # ランダムウォークの価格での各戦略の成績（行＝試行）
+    pbo_all: dict = field(default_factory=dict)  # 全候補（戦略 × パラメータ）での PBO
+    n_trials: int = 0                # DSR に使った「試した数」
+    sr_variance: float = math.nan    # 候補どうしのシャープレシオ（1日あたり）のばらつき
+    best_config: str = ""            # 開発用データ全体でシャープレシオが最も高かった候補
+    best_dsr: dict = field(default_factory=dict)
 
 
 def evaluate_all(
     raw: pd.DataFrame, base: IndicatorParams, risk: RiskParams, rules: ExitRules, costs: Costs, pip: float,
     runs: int = 200, k: int = 5, train_mult: int = 2, holdout_start: pd.Timestamp | None = None,
+    rw_paths: int = 50, n_trials: int | None = None,
 ) -> Report:
-    """raw は開発用データ（最終テスト期間より前）。holdout_start を渡すと、それ以降の足が混ざっていたら止める。"""
+    """raw は開発用データ（最終テスト期間より前）。holdout_start を渡すと、それ以降の足が混ざっていたら止める。
+
+    n_trials は DSR に使う「これまでに試した組み合わせの数」。省略するとこの評価で試した候補の数を使う
+    （記録を使う場合は、試行を記録してから finalize() をもう一度呼ぶ）。
+    """
     if holdout_start is not None and len(raw) and raw.index[-1] >= holdout_start:
         from .holdout import FinalTestAccessError
         raise FinalTestAccessError(f"最終テスト期間（{holdout_start} 以降）のデータがバックテストに渡されています")
@@ -311,7 +385,9 @@ def evaluate_all(
     cache[base] = ind
     bars = Bars(ind)
     n = len(ind)
-    reports, rates = [], []
+    days = overfit.business_days(ind.index[WARMUP], ind.index[-1])
+    reports, rates, grid = [], [], {}
+    rw = random_walk_baseline(raw, base, risk, rules, costs, pip, rw_paths, seed=7) if rw_paths else pd.DataFrame()
     for i, st in enumerate(strategies.STRATEGIES):
         sig = strategies.signals(ind, st, base).tolist()
         full = simulate(bars, sig, risk, rules, costs, pip, WARMUP, n)
@@ -324,15 +400,53 @@ def evaluate_all(
         wf_windows = [(f.test[0], f.test[1], f.test_rate) for f in wf.folds]
         wf_rand, _ = random_baseline(bars, wf_windows, risk, rules, costs, pip, runs, seed=100 + i)
         wf_beat = beat_ratio(wf.test_metrics["total"], wf_rand["total"])
+
+        def exit_times(t: pd.DataFrame) -> pd.Index:
+            return ind.index[t["exit_i"].to_numpy(dtype=int)]
+
+        full_daily = overfit.daily_pnl(exit_times(full), full["pips"], days)
+        wf_days = overfit.business_days(ind.index[wf.folds[0].test[0]], ind.index[-1])
+        wt = wf.test_trades
+        wf_daily = overfit.daily_pnl(exit_times(wt), wt["pips"], wf_days)
+
+        # PBO 用：この戦略の全パラメータ候補を、開発用データ全体で動かした日ごとの損益
+        for cand in candidates(raw, st, base, cache):
+            t = simulate(cand.bars, cand.sig, risk, rules, costs, pip, WARMUP, n)
+            grid[f"{st.key}|{describe_params(st.key, cand.overrides)}"] = overfit.daily_pnl(exit_times(t), t["pips"], days)
+
         reports.append(StrategyReport(
-            st, full, fm, full_rand, beat_ratio(fm["total"], full_rand["total"]),
-            wf, wf_rand, wf_beat, assess(wf, wf_beat, k),
+            st, full, fm, full_rand, beat_ratio(fm["total"], full_rand["total"]), wf, wf_rand, wf_beat, ("", ""),
+            full_daily=full_daily, wf_daily=wf_daily,
+            full_sharpe=overfit.annualized(overfit.sharpe(full_daily)),
+            wf_sharpe=overfit.annualized(overfit.sharpe(wf_daily)),
+            rw_beat=beat_ratio(fm["total"], rw[st.key]) if len(rw) else math.nan,
+            yearly_full=yearly(full, ind.index), yearly_wf=yearly(wt, ind.index),
         ))
 
     base_rand, curves = random_baseline(
         bars, [(WARMUP, n, float(np.mean(rates)))], risk, rules, costs, pip, runs, seed=999, curves=True
     )
-    return Report(WARMUP, reports, base_rand, curves, k, trial_rows(reports, base, risk, rules))
+    rep = Report(WARMUP, reports, base_rand, curves, k, trial_rows(reports, base, risk, rules),
+                 grid_daily=pd.DataFrame(grid), random_walk=rw)
+    rep.pbo_all = overfit.pbo_cscv(rep.grid_daily)
+    for r in reports:
+        cols = [c for c in rep.grid_daily.columns if c.startswith(r.strategy.key + "|")]
+        r.pbo = overfit.pbo_cscv(rep.grid_daily[cols])
+    return finalize(rep, n_trials if n_trials is not None else rep.grid_daily.shape[1])
+
+
+def finalize(rep: Report, n_trials: int) -> Report:
+    """試した数 n_trials を使って DSR を計算し、判定を決める（試行を記録した後に呼び直してよい）。"""
+    srs = rep.grid_daily.apply(overfit.sharpe)
+    rep.n_trials = int(n_trials)
+    rep.sr_variance = float(srs.var(ddof=1)) if len(srs) > 1 else 0.0
+    rep.best_config = str(srs.idxmax()) if len(srs) else ""
+    if rep.best_config:
+        rep.best_dsr = overfit.deflated_sharpe(rep.grid_daily[rep.best_config].to_numpy(), rep.n_trials, rep.sr_variance)
+    for r in rep.reports:
+        r.dsr = overfit.deflated_sharpe(r.wf_daily.to_numpy(), rep.n_trials, rep.sr_variance)
+        r.verdict = assess(r.wf, r.wf_beat, rep.k, r.dsr.get("dsr", math.nan), r.pbo.get("pbo", math.nan))
+    return rep
 
 
 def trial_rows(reports: list[StrategyReport], base: IndicatorParams, risk: RiskParams, rules: ExitRules) -> list[dict]:
@@ -353,18 +467,33 @@ def trial_rows(reports: list[StrategyReport], base: IndicatorParams, risk: RiskP
     return rows
 
 
-def assess(wf: WalkForwardResult, beat: float, k: int) -> tuple[str, str]:
-    """ウォークフォワードの検証区間の成績から、優位性がありそうかを機械的に判定する。"""
+def assess(wf: WalkForwardResult, beat: float, k: int, dsr: float = math.nan, pbo: float = math.nan) -> tuple[str, str]:
+    """ウォークフォワードの検証区間の成績から、優位性がありそうかを機械的に判定する。
+
+    「有望」は、取引100回以上・ランダム売買の95%以上を上回る・黒字の区間が6割以上・
+    DSR（試した数で割り引いたシャープレシオ）95%以上・PBO（パラメータ選びの過学習の確率）50%未満、をすべて満たすときだけ。
+    """
     m = wf.test_metrics
     if m["n"] < 20:
         return "判断材料不足", f"検証区間での取引が {m['n']} 回しかなく、偶然との区別がつきません。"
     if m["total"] <= 0:
         return "優位性なし", "コストを含めると、まだ見ていない期間でマイナスでした。"
-    if beat >= 0.95 and wf.positive_folds >= math.ceil(k * 0.6):
-        return "有望（要継続監視）", (
-            f"検証区間でプラス、ランダム売買の {beat:.0%} を上回り、{wf.positive_folds}/{k} 区間で黒字でした。"
-            "ただし複数の戦略を試した中での結果なので、偶然の可能性は残ります。"
-        )
-    if beat >= 0.95:
+    if beat < 0.95:
+        return "偶然の範囲", f"検証区間ではプラスでしたが、ランダム売買の {beat:.0%} しか上回っておらず、偶然でも出る程度の成績です。"
+    if wf.positive_folds < math.ceil(k * 0.6):
         return "不安定", f"合計ではランダム売買を上回りましたが、黒字の区間は {wf.positive_folds}/{k} だけで、一部の期間に頼った成績です。"
-    return "偶然の範囲", f"検証区間ではプラスでしたが、ランダム売買の {beat:.0%} しか上回っておらず、偶然でも出る程度の成績です。"
+    base = f"検証区間でプラス、ランダム売買の {beat:.0%} を上回り、{wf.positive_folds}/{k} 区間で黒字でした。"
+    if m["n"] < MIN_TRADES_RELIABLE:
+        return "参考値", base + f"ただし取引が {m['n']} 回と少ない（{MIN_TRADES_RELIABLE}回未満）ため、参考値として扱います。"
+    if math.isnan(dsr) or dsr < 0.95:
+        d = "計算できません" if math.isnan(dsr) else f"{dsr:.0%}"
+        return "偶然の可能性", base + (f"ただし、試した組み合わせの数で割り引くと、偶然ではない確率（DSR）は {d} で、"
+                                   "95%に届きません。たくさん試した中から良いものを選んだだけの可能性があります。")
+    if not math.isnan(pbo) and pbo >= 0.5:
+        return "過学習の疑い", base + (f"ただし、パラメータ選びが過学習している確率（PBO）が {pbo:.0%} と高く、"
+                                   "過去に一番良かったパラメータが、この先も良いとは言えません。")
+    return "有望（要継続監視）", base + (
+        f"試した数で割り引いても偶然ではない確率（DSR）は {dsr:.0%}"
+        + ("" if math.isnan(pbo) else f"、パラメータ選びの過学習の確率（PBO）は {pbo:.0%}")
+        + "でした。それでも将来の利益は保証されないため、本番の記録で確かめ続けます。"
+    )

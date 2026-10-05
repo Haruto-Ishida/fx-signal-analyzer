@@ -54,6 +54,9 @@ def test_first_cycle_trains_and_logs_only_latest(world):
     assert (sl["signal_time"] == FULL.index[1499]).all()  # 過去にさかのぼって記録しない
     v = tracking.load_verdicts(world.con, PAIR, TF)
     assert r.verdicts_updated and sorted(v["source"]) == sorted(s.key for s in strategies.STRATEGIES)
+    # DSR は記録済みの試行すべて（推定の過去分を含む）で割り引く
+    assert v["n_trials"].notna().all() and (v["n_trials"] >= 37).all()
+    assert v["dsr"].between(0, 1).all() and v["pbo"].between(0, 1).all()
 
     # 最終テスト期間：直近20%で固定。検証（判定）はそれより前だけ、本番モデルは最新まで
     b = holdout.get(PAIR, TF)
