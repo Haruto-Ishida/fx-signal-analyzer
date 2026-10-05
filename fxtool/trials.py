@@ -66,6 +66,13 @@ def count(con: sqlite3.Connection, pair: str | None = None, tf: str | None = Non
     return int(con.execute(q, params).fetchone()[0])
 
 
+def count_with(con: sqlite3.Connection, pair: str, tf: str, planned: list[dict]) -> int:
+    """記録済みの設定に、これから試す予定の設定（planned）を加えた種類の数。
+    同じ処理の中で複数の評価をするとき、すべて同じ「試した数」で割り引くために使う。"""
+    have = {r[0] for r in con.execute("SELECT DISTINCT config_hash FROM trials WHERE pair=? AND tf=?", (pair, tf))}
+    return len(have | {config_hash(r["family"], r["config"]) for r in planned})
+
+
 def summary(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
     return pd.read_sql_query(
         """SELECT family, origin, COUNT(DISTINCT config_hash) AS n_configs, COUNT(*) AS n_runs

@@ -36,6 +36,17 @@ class Context:
     balance_jpy: float = DEFAULT_BALANCE_JPY                 # ポジションサイズの目安用
     risk_pct: float = DEFAULT_RISK_PCT
     usdjpy: float | None = None                              # 円以外の通貨の損失を円に直すため
+    signal_log: pd.DataFrame = field(default_factory=pd.DataFrame)  # 本番の記録（フェーズ4）
+    meta_model: dict | None = None                           # 本番の機械学習（メタラベリング）の最新モデル
+    halt: object = None                                      # 最大損失による停止の状態（tracking.Halt）
+
+    def meta_for(self, source: str, signal_time: pd.Timestamp) -> tuple[float, str] | None:
+        """そのシグナルについて、本番の機械学習が記録した（確率, 乗る/見送り）。まだなければ None。"""
+        sl = self.signal_log
+        if sl.empty or signal_time is None:
+            return None
+        m = sl[(sl["source"] == source) & (sl["signal_time"] == signal_time) & sl["meta_p"].notna()]
+        return None if m.empty else (float(m["meta_p"].iat[0]), str(m["meta_decision"].iat[0]))
 
     @property
     def confirmed(self) -> pd.DataFrame:

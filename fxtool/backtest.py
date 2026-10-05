@@ -449,6 +449,14 @@ def finalize(rep: Report, n_trials: int) -> Report:
     return rep
 
 
+def planned_trials(base: IndicatorParams, risk: RiskParams, rules: ExitRules) -> list[dict]:
+    """evaluate_all が試す設定（全戦略のパラメータ候補。初期パラメータも候補に含まれる）。"""
+    from .trials import strategy_config
+
+    return [{"family": "strategy", "name": key, "config": strategy_config(key, replace(base, **ov), risk, rules)}
+            for key, grid in PARAM_GRIDS.items() for ov in grid]
+
+
 def trial_rows(reports: list[StrategyReport], base: IndicatorParams, risk: RiskParams, rules: ExitRules) -> list[dict]:
     """全期間（初期パラメータ）と、ウォークフォワードで試した全候補を、試行として記録する形にする。"""
     from .trials import strategy_config

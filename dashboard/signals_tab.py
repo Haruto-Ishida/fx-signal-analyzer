@@ -7,7 +7,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from fxtool import commentary, data, sizing, strategies, tracking
-from fxtool.config import MIN_UNITS
+from fxtool.config import LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, MIN_UNITS
 
 from .common import BUY_COLOR, NEUTRAL_COLOR, SELL_COLOR, Context, color_decision
 
@@ -36,6 +36,9 @@ def render(ctx: Context) -> None:
             + ("" if not ctx.verdicts.empty else " 戦略の検証結果がまだ計算されていないため、検証にもとづく注意点は含まれていません。")
         )
 
+    if ctx.halt is not None and ctx.halt.active:
+        st.error(f"⛔ **新しいシグナルは停止中です**：{ctx.halt.reason}。"
+                 "この間に出たシグナルは「停止中」として記録だけします。")
     counts = {k: sum(v.decision == k for v in views) for k in ("買い", "売り", "様子見")}
     line = f"**戦略の判断**：買い {counts['買い']}・売り {counts['売り']}・様子見 {counts['様子見']}"
     if ctx.weights:
@@ -43,11 +46,11 @@ def render(ctx: Context) -> None:
         line += f"　｜　**重み付き総合スコア**：{score:+.2f}（{tracking.score_label(score)}）"
     st.markdown(line)
     if ctx.weights:
-        st.caption("重み付き総合スコアは、各戦略の判断（買い +1・売り −1・様子見 0）を、直近の成績で決めた重みで平均したもの（−1〜+1）です。"
+        st.caption(f"重み付き総合スコアは、各戦略の判断（買い +1・売り −1・様子見 0）を、**本番の記録**の直近{LIVE_WEIGHT_WINDOW}回の"
+                   f"成績で決めた重みで平均したもの（−1〜+1）です。決済済みが{LIVE_WEIGHT_MIN_TRADES}回未満の戦略は重み 1.0 です。"
                    "どの戦略にもはっきりした優位性は確認できていないので、あくまで判断の目安です。")
     else:
-        st.caption("戦略の重み付けは停止中です（以前の重みは最終テスト期間のデータから計算していたため。"
-                   "フェーズ4の改修で、本番の記録にもとづく方法に作り直します）。")
+        st.caption("戦略の重みは、本番の記録がたまると計算されます（それまでは全戦略を同じ重みとして扱います）。")
 
     # ---------------- 戦略ごとのシグナル ----------------
     def status_text(v: strategies.StrategyView) -> str:
@@ -70,13 +73,24 @@ def render(ctx: Context) -> None:
             return s.note
         return f"{s.units:,}通貨（損切り時 −{s.loss_at_stop_jpy:,.0f}円）"
 
+    meta_ok = bool(ctx.meta_model and ctx.meta_model.get("ok"))
+
+    def meta_text(v: strategies.StrategyView) -> str:
+        m = ctx.meta_for(v.strategy.key, v.signal_time)
+        if m is None:
+            return "—"
+        p, dec = m
+        return f"{dec}（{p:.0%}）" + ("" if meta_ok else "・参考")
+
+    halted = ctx.halt is not None and ctx.halt.active
     rows = []
     for v in views:
         has = v.signal_time is not None
         rows.append({
             "戦略": v.strategy.name,
             "タイプ": v.strategy.kind,
-            "判断": v.decision,
+            "判断": ("停止中" if halted and v.decision in ("買い", "売り") and v.bars_ago == 0 else v.decision),
+            "機械学習（乗る/見送り）": meta_text(v),
             "直近のシグナル": f"{'買い' if v.direction > 0 else '売り'}　{ctx.label(v.signal_time)}" if has else "なし",
             "何本前": v.bars_ago if has else None,
             "エントリー（次の足の始値）": (ctx.fmt_price(v.entry) + ("" if v.entry_fixed else "（見込み）")) if has else "—",
@@ -95,6 +109,8 @@ def render(ctx: Context) -> None:
         "1本の足の中で損切りと利確の両方に届いた場合は、損切りが先とみなしています。"
         f"数量の目安は、損切りになったときの損失が口座残高 {ctx.balance_jpy:,.0f}円 の {ctx.risk_pct:g}% 以内に収まる数量です"
         f"（{MIN_UNITS:,}通貨単位で切り捨て。注文はしません）。"
+        "「機械学習（乗る/見送り）」は、本番のメタラベリングのモデルが、そのシグナルにコスト後に利益が出る確率を予測した結果です"
+        + ("。" if meta_ok else "（開発用データの検証で条件を満たしていないため「参考」。売買の判断には使わないでください）。")
     )
 
     # ---------------- チャート ----------------

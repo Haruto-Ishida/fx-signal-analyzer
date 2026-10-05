@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
@@ -31,13 +31,43 @@ from .config import IndicatorParams, RiskParams
 from .ml import feature_label as _base_label
 from .ml import make_features
 
+class QuantileBinner(BaseEstimator, TransformerMixin):
+    """勾配ブースティングの前処理：各特徴量を、学習データの分位点（重みなし）で最大 max_bins 段階に区切る。
+
+    scikit-learn 1.9 では、サンプルの重みを渡すと勾配ブースティングの「区切りの計算」が約30倍遅くなる。
+    特徴量の値が max_bins 種類以下なら勾配ブースティングは速い計算方法を使うので、区切りをここで先に計算しておく。
+    木の学習にはサンプルの重みをそのまま使う。区切りは学習データだけから計算するので、未来の情報は混ざらない。"""
+
+    def __init__(self, max_bins: int = 255):
+        self.max_bins = max_bins
+
+    def fit(self, X, y=None):
+        X = np.asarray(X, dtype=float)
+        self.edges_ = []
+        for j in range(X.shape[1]):
+            u = np.unique(X[:, j])
+            if len(u) <= self.max_bins:
+                edges = (u[:-1] + u[1:]) / 2
+            else:  # scikit-learn（重みなし）と同じ分位点の求め方
+                qs = np.linspace(0, 100, self.max_bins + 1)[1:-1]
+                edges = np.percentile(X[:, j], qs, method="averaged_inverted_cdf")
+            self.edges_.append(edges)
+        return self
+
+    def transform(self, X):
+        # 区切り e[i-1] < x <= e[i] を i 番目の段階にする（scikit-learn と同じ向き）
+        X = np.asarray(X, dtype=float)
+        return np.column_stack([np.searchsorted(e, X[:, j], side="left") for j, e in enumerate(self.edges_)]).astype(float)
+
+
 LADDER = {
     "logistic": ("ロジスティック回帰", make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000))),
+    # n_jobs=1：データが小さいので並列化しない方が速い（Windows では並列処理の起動・終了に毎回数秒かかっていた）
     "rf": ("ランダムフォレスト", RandomForestClassifier(
-        n_estimators=150, max_depth=5, min_samples_leaf=50, max_features="sqrt", random_state=0, n_jobs=-1)),
-    "gbm": ("勾配ブースティング", HistGradientBoostingClassifier(
+        n_estimators=150, max_depth=5, min_samples_leaf=50, max_features="sqrt", random_state=0, n_jobs=1)),
+    "gbm": ("勾配ブースティング", make_pipeline(QuantileBinner(), HistGradientBoostingClassifier(
         max_depth=3, learning_rate=0.05, max_iter=200, min_samples_leaf=100, l2_regularization=1.0,
-        early_stopping=False, random_state=0)),
+        early_stopping=False, random_state=0))),
 }
 MODES = {"meta": "メタラベリング（おすすめ）", "direction": "方向予測（トリプルバリア）"}
 # 確信度の初期値と、DSR のばらつきの計算に使う代表的な確信度。メタラベリングは「勝つ確率」なので、
@@ -84,26 +114,38 @@ def _fit(template, kind: str, X, y, w):
     return m.fit(X, y, sample_weight=w)
 
 
-def build_meta(ind: pd.DataFrame, tf_key: str, p: IndicatorParams, risk: RiskParams, max_bars: int,
-               cost_pips: float, pip: float) -> Samples:
-    F = make_features(ind, tf_key)
+def signal_events(ind: pd.DataFrame, p: IndicatorParams) -> pd.DataFrame:
+    """5つの戦略のシグナル（列 i, d, source）。足の順、同じ足では戦略名の順。"""
     ev = []
     for s in strategies.STRATEGIES:
         sig = strategies.signals(ind, s, p).to_numpy()
         for i in np.flatnonzero(sig):
             ev.append((int(i), int(sig[i]), s.key))
-    events = pd.DataFrame(ev, columns=["i", "d", "source"]).sort_values(["i", "source"], kind="stable").reset_index(drop=True)
-    tb = labeling.triple_barrier(ind, events, risk, max_bars, cost_pips, pip)
-    tb["source"] = events["source"].to_numpy()[tb["ev"].to_numpy()]
-    X = F.iloc[tb["i"].to_numpy()].reset_index(drop=True)
-    d = tb["d"].to_numpy()
+    return pd.DataFrame(ev, columns=["i", "d", "source"]).sort_values(["i", "source"], kind="stable").reset_index(drop=True)
+
+
+def meta_features(F: pd.DataFrame, i: np.ndarray, d: np.ndarray, source: np.ndarray) -> pd.DataFrame:
+    """メタラベリングの特徴量：その足の特徴量 ＋ シグナルの方向を掛けたもの ＋ どの戦略のシグナルか。
+    検証と本番の予測で同じものを使う（答えのないシグナルにも使える）。"""
+    X = F.iloc[np.asarray(i, dtype=int)].reset_index(drop=True)
+    d = np.asarray(d, dtype=float)
     for col in [c for c in F.columns if c.startswith("ret_")] + list(_DIRECTIONAL):
         X[f"{col}_x_dir"] = X[col].to_numpy() * d
     X["bb_pos_x_dir"] = (X["bb_pos"].to_numpy() - 0.5) * d
     X["rsi_x_dir"] = (X["rsi"].to_numpy() - 50) * d
     X["dir"] = d
     for s in strategies.STRATEGIES:
-        X[f"from_{s.key}"] = (tb["source"].to_numpy() == s.key).astype(float)
+        X[f"from_{s.key}"] = (np.asarray(source) == s.key).astype(float)
+    return X
+
+
+def build_meta(ind: pd.DataFrame, tf_key: str, p: IndicatorParams, risk: RiskParams, max_bars: int,
+               cost_pips: float, pip: float) -> Samples:
+    F = make_features(ind, tf_key)
+    events = signal_events(ind, p)
+    tb = labeling.triple_barrier(ind, events, risk, max_bars, cost_pips, pip)
+    tb["source"] = events["source"].to_numpy()[tb["ev"].to_numpy()]
+    X = meta_features(F, tb["i"].to_numpy(), tb["d"].to_numpy(), tb["source"].to_numpy())
     ok = ~X.isna().any(axis=1).to_numpy()
     tb, X = tb[ok].reset_index(drop=True), X[ok].reset_index(drop=True)
     return Samples("meta", X, (tb["pips"].to_numpy() > 0).astype(float), tb["i"].to_numpy(), tb["t1"].to_numpy(),
@@ -356,6 +398,14 @@ class Report:
     trials: list[dict] = field(default_factory=list)
 
 
+def planned_trials(mode: str, threshold: float, max_bars: int, k: int = 5) -> list[dict]:
+    """evaluate_all が試す設定（3つのモデル）。"""
+    from .trials import ml_config
+    label = "triple_barrier_meta" if mode == "meta" else "triple_barrier_direction"
+    return [{"family": "ml", "name": kind, "config": ml_config(kind, max_bars, threshold, label=label, features="v2", k=k)}
+            for kind in LADDER]
+
+
 def choose_model(results: dict[str, Result]) -> tuple[str, list[str]]:
     """単純なモデルから順に、コスト後の検証区間の損益で勝ったときだけ、より複雑なモデルに進む。"""
     order = [k for k in LADDER if k in results]
@@ -386,6 +436,12 @@ def evaluate_all(smp: Samples, threshold: float, k: int = 5, runs: int = 200, n_
                    "metrics": {"acc": r.acc, "logloss": r.logloss, "base_logloss": r.base_logloss, "auc": r.auc,
                                "trade": r.trade_metrics, "beat_random": r.beat}} for r in results.values()]
     return finalize(rep, smp, n_trials if n_trials is not None else len(results) * len(THRESHOLDS[smp.mode]))
+
+
+def fit_production(smp: Samples, kind: str):
+    """本番用：選んだモデルの種類（設定は固定）で、決着したすべてのラベルを使って学習する。重みは独自性。"""
+    w = labeling.uniqueness(smp.t0, smp.t1)
+    return _fit(LADDER[kind][1], kind, smp.X.to_numpy(), smp.y, w / w.mean())
 
 
 def finalize(rep: Report, smp: Samples, n_trials: int) -> Report:

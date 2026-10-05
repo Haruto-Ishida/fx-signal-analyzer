@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS log_state (
 """
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
+JST = pd.Timedelta(hours=9)
 
 
 def ts_str(ts: pd.Timestamp) -> str:
@@ -127,6 +128,19 @@ def migrate(con: sqlite3.Connection) -> None:
     for c, typ in (("dsr", "REAL"), ("pbo", "REAL"), ("n_trials", "INTEGER"), ("wf_n", "INTEGER")):
         if c not in ver_cols:
             con.execute(f"ALTER TABLE backtest_verdicts ADD COLUMN {c} {typ}")
+    # フェーズ4改修：メタラベリングの判定・最大損失による停止を記録に残す
+    sl_cols = _columns(con, "signal_log")
+    for c, typ in (("meta_p", "REAL"), ("meta_decision", "TEXT"), ("meta_version", "TEXT"),
+                   ("suppressed", "INTEGER NOT NULL DEFAULT 0")):
+        if c not in sl_cols:
+            con.execute(f"ALTER TABLE signal_log ADD COLUMN {c} {typ}")
+    reg_cols = _columns(con, "model_registry")
+    for c, typ in (("kind", "TEXT"), ("mode", "TEXT"), ("threshold", "REAL"), ("n_trials", "INTEGER")):
+        if c not in reg_cols:
+            con.execute(f"ALTER TABLE model_registry ADD COLUMN {c} {typ}")
+    # 重みの計算元：以前のものは直近のバックテスト（＝最終テスト期間）から計算していた
+    if "basis" not in _columns(con, "weight_history"):
+        con.execute("ALTER TABLE weight_history ADD COLUMN basis TEXT NOT NULL DEFAULT 'backtest_recent'")
     from .trials import seed_retroactive
     seed_retroactive(con)
     con.commit()
@@ -206,11 +220,94 @@ def score_label(score: float) -> str:
 
 
 def latest_weights(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
+    """本番の記録から計算した最新の重み（最終テスト期間のバックテストから計算していた以前の重みは使わない）。"""
     return pd.read_sql_query(
-        """SELECT * FROM weight_history WHERE pair=? AND tf=? AND bar_time =
-           (SELECT MAX(bar_time) FROM weight_history WHERE pair=? AND tf=?)""",
+        """SELECT * FROM weight_history WHERE pair=? AND tf=? AND basis='live' AND bar_time =
+           (SELECT MAX(bar_time) FROM weight_history WHERE pair=? AND tf=? AND basis='live')""",
         con, params=(pair, tf, pair, tf),
     )
+
+
+DONE = ("利確", "損切り", "期限")
+
+
+def live_performance(closed: pd.DataFrame, window: int, min_trades: int) -> list[RecentPerf]:
+    """本番の記録（決済済み）から、戦略ごとの直近 window 回の成績と重みを計算する。
+    取引が min_trades 回未満の戦略は z = 0（重み 1）。重みは平均 1 にそろえる。"""
+    out = []
+    for s in strategies.STRATEGIES:
+        g = closed[closed["source"] == s.key].sort_values("exit_time").tail(window)
+        p = g["pips"].to_numpy(dtype=float)
+        m = bt.metrics(p)
+        z = z_score(p) if len(p) >= min_trades else 0.0
+        out.append(RecentPerf(s.key, m["n"], m["total"], m["pf"], z, weight_from_z(z)))
+    mean_w = float(np.mean([r.weight for r in out]))
+    for r in out:
+        r.weight /= mean_w
+    return out
+
+
+@dataclass
+class Halt:
+    active: bool
+    reason: str
+    day_r: float      # 日本時間の今日の損益（R）
+    week_r: float     # 日本時間の今週（月曜から）の損益（R）
+
+
+def r_multiple(closed: pd.DataFrame, sl_atr: float, pip: float) -> pd.Series:
+    """損益を「1回の損切り幅（1R）」の何倍かで表す。1R は口座残高の許容損失（初期値 1%）に相当する。"""
+    return closed["pips"] / (sl_atr * closed["atr"] / pip)
+
+
+def loss_halt(closed: pd.DataFrame, now: pd.Timestamp, sl_atr: float, pip: float, daily_max: float,
+              weekly_max: float) -> Halt:
+    """日本時間のその日・その週に決済した本番の記録の損益が上限に達したら、新しいシグナルを止める。"""
+    if closed.empty:
+        return Halt(False, "", 0.0, 0.0)
+    jst_now = now + JST
+    today = jst_now.normalize()
+    week_start = today - pd.Timedelta(days=today.dayofweek)
+    exit_jst = pd.DatetimeIndex(closed["exit_time"]) + JST
+    r = r_multiple(closed, sl_atr, pip).to_numpy()
+    day_r = float(r[exit_jst >= today].sum())
+    week_r = float(r[exit_jst >= week_start].sum())
+    eps = 1e-9  # 小数の計算の誤差（例：−1.9999999999999998）で上限の判定がずれないように
+    if day_r <= -daily_max + eps:
+        return Halt(True, f"今日（日本時間）の損失が {day_r:+.1f}R に達したため、今日は新しいシグナルを出しません"
+                          f"（上限 −{daily_max:g}R ＝ 口座残高の約{daily_max:g}%）", day_r, week_r)
+    if week_r <= -weekly_max + eps:
+        return Halt(True, f"今週（日本時間の月曜から）の損失が {week_r:+.1f}R に達したため、今週は新しいシグナルを出しません"
+                          f"（上限 −{weekly_max:g}R ＝ 口座残高の約{weekly_max:g}%）", day_r, week_r)
+    return Halt(False, "", day_r, week_r)
+
+
+def meta_conditions(registry: pd.DataFrame, signals: pd.DataFrame) -> list[Condition]:
+    """メタラベリングの本番モデルについての警告。registry はメタのモデルの履歴（古い順）、signals は本番の記録。"""
+    out = []
+    if registry.empty:
+        return out
+    latest = registry.iloc[-1]
+    if not latest["ok"] and registry["ok"].iloc[:-1].astype(bool).any():
+        out.append(Condition("ml_meta", "lost_edge", "warning",
+                             "機械学習（メタラベリング）：再学習の結果、シグナルを出す条件を満たさなくなりました（以前は満たしていました）"))
+    done = signals[signals["status"].isin(DONE) & signals["meta_decision"].isin(["乗る", "見送り"])]
+    taken, skipped = done[done["meta_decision"] == "乗る"], done[done["meta_decision"] == "見送り"]
+    if len(done) >= 30 and len(taken) >= 10 and len(skipped) >= 10:
+        a, b = taken["pips"].mean(), skipped["pips"].mean()
+        if a < b:
+            out.append(Condition("ml_meta", "filter_hurts", "warning",
+                                 f"機械学習（メタラベリング）：本番の記録では、乗ったシグナルの1回あたり {a:+.1f} pips が、"
+                                 f"見送ったシグナルの {b:+.1f} pips を下回っています（見送りが逆効果）"))
+    return out
+
+
+def monthly(closed: pd.DataFrame) -> pd.DataFrame:
+    """決済した月（日本時間）× 戦略 の損益（pips）。"""
+    if closed.empty:
+        return pd.DataFrame()
+    month = (pd.DatetimeIndex(closed["exit_time"]) + JST).strftime("%Y-%m")
+    return closed.assign(month=month).pivot_table(index="month", columns="source", values="pips", aggfunc="sum")
 
 
 # ---------------- 警告 ----------------
@@ -329,7 +426,7 @@ def load_signal_log(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame
         "SELECT * FROM signal_log WHERE pair=? AND tf=? ORDER BY signal_time", con, params=(pair, tf),
         parse_dates=["signal_time", "exit_time", "logged_at"],
     )
-    return _numeric(df, ["entry", "sl", "tp", "atr", "prob", "weight", "exit_price", "pips"])
+    return _numeric(df, ["entry", "sl", "tp", "atr", "prob", "weight", "exit_price", "pips", "meta_p"])
 
 
 def load_predictions(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
@@ -345,7 +442,7 @@ def load_registry(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
         "SELECT * FROM model_registry WHERE pair=? AND tf=? ORDER BY trained_at", con, params=(pair, tf),
         parse_dates=["trained_at", "trained_bar", "trained_through", "eval_from", "eval_to", "train_from"],
     )
-    return _numeric(df, ["acc", "majority_acc", "logloss", "base_logloss", "trade_pips", "beat"])
+    return _numeric(df, ["acc", "majority_acc", "logloss", "base_logloss", "trade_pips", "beat", "threshold", "n_trials"])
 
 
 def load_alerts(con: sqlite3.Connection, pair: str | None = None, tf: str | None = None,

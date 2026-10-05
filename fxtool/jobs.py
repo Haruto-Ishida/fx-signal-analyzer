@@ -1,31 +1,42 @@
-"""1回分の定期処理（フェーズ4）：取得 → 記録 → 答え合わせ → 再学習 → 重み → 警告。
+"""1回分の定期処理：取得 → 記録 → 機械学習の判定 → 再学習 → 答え合わせ → 重み → 警告。
 
 記録の決まりごと
 - 戦略のシグナルは、記録を始めた後に確定した足の分だけ記録する（過去にさかのぼって作らない）。
-- 機械学習の予測は「その足より前のデータだけで学習したモデル」でのみ行う（学習に使った最後の足より後の足だけ）。
-  再学習の前に、それまでのモデルで新しい足を予測しておく。
-- 記録した予測・シグナルの結果は、確定した足だけで答え合わせする。
+  エントリーは次の足の始値（それまでは「待機」）。
+- 機械学習（メタラベリング）の判定は、そのシグナルの足までのデータで学習したモデルでだけ行う
+  （モデルを学習した時点の最新の足 trained_bar 以降のシグナルだけ）。再学習の前に、それまでのモデルで判定しておく。
+- 戦略・設定・モデルを選ぶ判断（戦略の判定・機械学習の条件・DSR）は開発用データだけで行う。
+  本番モデルは、選んだ設定を固定したまま、決着したすべてのラベルで学習する。
+- 重みと成績悪化の警告は、本番の記録（＝最も信頼できる最終テスト）から計算する。
+- 本番の記録の損益が、日本時間のその日・その週の上限に達したら、新しいシグナルは「停止中」として記録する。
 """
 from __future__ import annotations
 
 import math
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import joblib
 import numpy as np
 import pandas as pd
 
 from . import backtest as bt
-from . import data, holdout, indicators, ml, strategies, tracking, trials
+from . import data, holdout, indicators, ml, ml_eval, strategies, tracking, trials
 from .config import (
-    DEFAULT_SLIPPAGE, DEFAULT_SPREAD, ML_HORIZON, ML_THRESHOLD, MODELS_DIR, PAIRS, ROOT, TIMEFRAMES, TRACKING,
-    VERTICAL_BARRIER, IndicatorParams, RiskParams, pip_size,
+    DAILY_MAX_LOSS_R, DEFAULT_SLIPPAGE, DEFAULT_SPREAD, LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, ML_META_FOLDS,
+    ML_META_THRESHOLD, MODELS_DIR, PAIRS, ROOT, TIMEFRAMES, TRACKING, VERTICAL_BARRIER, WEEKLY_MAX_LOSS_R,
+    IndicatorParams, RiskParams, pip_size,
 )
 from .tracking import ts_str
 
 P = IndicatorParams()
 RISK = RiskParams()
+LIVE_LABEL = f"本番の記録（直近{LIVE_WEIGHT_WINDOW}回）"
+
+# 定期処理での検証の細かさ（ランダム売買・ランダムウォークの試行回数）。テストでは小さくして速くする
+VERDICT_RANDOM_RUNS = 100
+VERDICT_RW_PATHS = 20
+META_RANDOM_RUNS = 200
 
 
 def default_costs(pair: str) -> bt.Costs:
@@ -40,25 +51,26 @@ class CycleResult:
     data_added: int = 0
     data_error: str | None = None
     signals_logged: int = 0
-    predictions_logged: int = 0
+    meta_judged: int = 0
     outcomes_closed: int = 0
     labels_filled: int = 0
-    retrained: list[str] = field(default_factory=list)
+    retrained: bool = False
     verdicts_updated: bool = False
     new_alerts: int = 0
+    halted: str = ""
     error: str | None = None
 
     def summary(self) -> str:
         if self.skipped:
             return "直前に実行済みのためスキップ"
-        parts = [
-            f"データ+{self.data_added}本", f"シグナル記録{self.signals_logged}件", f"予測記録{self.predictions_logged}件",
-            f"決済の答え合わせ{self.outcomes_closed}件", f"予測の答え合わせ{self.labels_filled}件",
-        ]
+        parts = [f"データ+{self.data_added}本", f"シグナル記録{self.signals_logged}件",
+                 f"機械学習の判定{self.meta_judged}件", f"決済の答え合わせ{self.outcomes_closed}件"]
         if self.retrained:
-            parts.append("再学習：" + "・".join(tracking.MODEL_NAMES[k] for k in self.retrained))
+            parts.append("機械学習を再学習")
         if self.verdicts_updated:
             parts.append("戦略の検証結果を更新")
+        if self.halted:
+            parts.append("最大損失のため新しいシグナルを停止中")
         if self.new_alerts:
             parts.append(f"新しい警告{self.new_alerts}件")
         if self.data_error:
@@ -89,12 +101,15 @@ def run_cycle(
     except Exception as e:  # 1つの通貨ペア・時間足の失敗で全体を止めない
         con.rollback()
         res.error = f"{type(e).__name__}: {e}"
-    con.execute(
-        "UPDATE job_runs SET finished_at=?, summary=?, error=? WHERE id=?",
-        (ts_str(data.now_utc() if now is None else now), res.summary(), res.error, run_id),
-    )
+    con.execute("UPDATE job_runs SET finished_at=?, summary=?, error=? WHERE id=?",
+                (ts_str(now), res.summary(), res.error, run_id))
     con.commit()
     return res
+
+
+def closed_signals(con, pair, tf_key) -> pd.DataFrame:
+    sl = tracking.load_signal_log(con, pair, tf_key)
+    return sl[sl["status"].isin(tracking.DONE)]
 
 
 def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
@@ -112,50 +127,70 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
     b = data.boundary(con, pair, tf_key, now)
     ind = indicators.add_all(conf, P)
     ind_dev = holdout.dev_part(ind, b)  # 選ぶ判断（検証・条件の判定）にはこれだけを使う
-    X = ml.make_features(ind, tf_key)
 
-    # 戦略の重みは、直近のバックテスト（＝最終テスト期間）から計算していたため、フェーズ4で本番の記録にもとづく
-    # 方法に作り直すまで停止する（全戦略 1.0）。直近成績の悪化警告も同じ理由で、本番の記録にもとづくものだけ出す。
-    weights = {s.key: 1.0 for s in strategies.STRATEGIES}
-
-    res.signals_logged = log_strategy_signals(con, pair, tf_key, ind, weights, now)
-
-    for kind in ml.MODELS:
-        reg = latest_model(con, pair, tf_key, kind)
-        if reg is not None:  # 再学習の前に、それまでのモデルで新しい足を予測する
-            res.predictions_logged += predict_and_log(con, pair, tf_key, kind, reg, ind, X, now)
-        if retrain and retrain_due(reg, ind, settings.retrain_every):
-            reg = train_and_register(con, pair, tf_key, kind, ind, ind_dev, b, costs, pip, now)
-            res.retrained.append(kind)
-            res.predictions_logged += predict_and_log(con, pair, tf_key, kind, reg, ind, X, now)
-
-    if retrain and verdicts_due(con, pair, tf_key, ind_dev):
-        save_verdicts(con, pair, tf_key, holdout.dev_part(conf, b), b, costs, pip, now)
-        res.verdicts_updated = True
-
+    # 先に答え合わせをして、最新の決済まで反映した記録で重みと最大損失を判断する
     fill_entries(con, pair, tf_key, raw)
     res.outcomes_closed = resolve_signals(con, pair, tf_key, ind, costs, pip)
-    res.labels_filled = fill_labels(con, pair, tf_key, ind)
 
-    closed = tracking.load_signal_log(con, pair, tf_key)
-    closed = closed[closed["status"].isin(["利確", "損切り", "期限"]) & ~closed["source"].str.startswith("ml_")]
-    period = "直近約1か月" if tf_key == "1h" else "直近約1年"
-    conds = tracking.strategy_conditions([], closed, period)
+    # 本番の記録にもとづく重みと、最大損失による停止
+    closed = closed_signals(con, pair, tf_key)
+    closed_strat = closed[~closed["source"].str.startswith("ml_")]
+    live = tracking.live_performance(closed_strat, LIVE_WEIGHT_WINDOW, LIVE_WEIGHT_MIN_TRADES)
+    con.executemany(
+        """INSERT OR REPLACE INTO weight_history
+           (pair, tf, bar_time, source, weight, recent_n, recent_pips, recent_pf, z, basis)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'live')""",
+        [(pair, tf_key, ts_str(ind.index[-1]), r.source, r.weight, r.n, r.total,
+          r.pf if math.isfinite(r.pf) else None, r.z) for r in live],
+    )
+    halt = tracking.loss_halt(closed, now, RISK.sl_atr, pip, DAILY_MAX_LOSS_R, WEEKLY_MAX_LOSS_R)
+    res.halted = halt.reason if halt.active else ""
+
+    res.signals_logged = log_strategy_signals(con, pair, tf_key, ind, {r.source: r.weight for r in live}, now,
+                                              suppressed=halt.active)
+    fill_entries(con, pair, tf_key, raw)
+
+    # この処理で試す予定の設定も含めた「試した数」。戦略の判定と機械学習の条件を、同じ数で割り引く
+    planned = (bt.planned_trials(P, RISK, exit_rules(tf_key))
+               + ml_eval.planned_trials("meta", ML_META_THRESHOLD, VERTICAL_BARRIER[tf_key], ML_META_FOLDS))
+    n_trials = trials.count_with(con, pair, tf_key, planned)
+
+    # 機械学習（メタラベリング）：再学習の前に、それまでのモデルで新しいシグナルを判定する
+    reg = latest_meta(con, pair, tf_key)
+    if reg is not None:
+        res.meta_judged += judge_signals(con, pair, tf_key, reg, ind)
+    if retrain and meta_retrain_due(reg, ind, settings.retrain_every, n_trials):
+        reg = train_meta(con, pair, tf_key, ind, ind_dev, b, costs, pip, now, n_trials)
+        res.retrained = True
+        res.meta_judged += judge_signals(con, pair, tf_key, reg, ind)
+
+    if retrain and verdicts_due(con, pair, tf_key, ind_dev, n_trials):
+        save_verdicts(con, pair, tf_key, holdout.dev_part(conf, b), b, costs, pip, now, n_trials)
+        res.verdicts_updated = True
+
+    res.outcomes_closed += resolve_signals(con, pair, tf_key, ind, costs, pip)
+    res.labels_filled = fill_labels(con, pair, tf_key, ind)  # 研究ノート反映前の予測の記録の答え合わせ
+
+    closed = closed_signals(con, pair, tf_key)
+    closed_strat = closed[~closed["source"].str.startswith("ml_")]
+    live = tracking.live_performance(closed_strat, LIVE_WEIGHT_WINDOW, LIVE_WEIGHT_MIN_TRADES)
+    conds = tracking.strategy_conditions(live, closed_strat, LIVE_LABEL)
     registry = tracking.load_registry(con, pair, tf_key)
-    preds = tracking.load_predictions(con, pair, tf_key)
-    for kind in ml.MODELS:
-        conds += tracking.model_conditions(
-            registry[(registry["model"] == kind) & (registry["horizon"] == ML_HORIZON)].reset_index(drop=True),
-            preds[(preds["model"] == kind) & (preds["horizon"] == ML_HORIZON)],
-        )
+    conds += tracking.meta_conditions(registry[registry["model"] == "meta"].reset_index(drop=True),
+                                      tracking.load_signal_log(con, pair, tf_key))
     conds += tracking.data_condition(ind.index[-1], now, tf.bar, settings.stale_bars)
+    if halt.active:
+        conds.append(tracking.Condition("risk", "max_loss", "critical", halt.reason))
     res.new_alerts = tracking.sync_alerts(con, pair, tf_key, conds, now)
     con.commit()
 
 
-def log_strategy_signals(con, pair, tf_key, ind, weights, now) -> int:
+# ---------------- シグナルの記録 ----------------
+
+def log_strategy_signals(con, pair, tf_key, ind, weights, now, suppressed: bool = False) -> int:
     """前回処理した足より後に確定した足のシグナルを記録する。初回は最新の確定足の分だけ。
-    エントリーは次の足の始値なので、ここでは「待機」として記録し、fill_entries で埋める。"""
+    エントリーは次の足の始値なので、ここでは「待機」として記録し、fill_entries で埋める。
+    最大損失で停止中なら suppressed=1 を付けて記録する（停止のルールの効果を後で確かめられるように）。"""
     n = len(ind)
     last = tracking.get_state(con, pair, tf_key, "strategy_last_bar")
     start = n - 1 if last is None else int(ind.index.searchsorted(pd.Timestamp(last), side="right"))
@@ -167,19 +202,20 @@ def log_strategy_signals(con, pair, tf_key, ind, weights, now) -> int:
         for i in range(start, n):
             if sig[i]:
                 rows.append((pair, tf_key, s.key, ts_str(ind.index[i]), int(sig[i]), float(atr[i]), max_bars,
-                             None, weights.get(s.key), ts_str(now)))
+                             None, weights.get(s.key), ts_str(now), int(suppressed)))
     added = _insert_signals(con, rows)
     tracking.set_state(con, pair, tf_key, "strategy_last_bar", ts_str(ind.index[-1]))
     return added
 
 
 def _insert_signals(con, rows) -> int:
-    """rows：(pair, tf, source, signal_time, direction, atr, max_bars, prob, weight, logged_at)。"""
+    """rows：(pair, tf, source, signal_time, direction, atr, max_bars, prob, weight, logged_at, suppressed)。"""
     before = con.total_changes
     con.executemany(
         """INSERT OR IGNORE INTO signal_log
-           (pair, tf, source, signal_time, direction, atr, max_bars, prob, weight, logged_at, status, entry_basis)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '待機', 'next_open')""", rows,
+           (pair, tf, source, signal_time, direction, atr, max_bars, prob, weight, logged_at, suppressed,
+            status, entry_basis)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '待機', 'next_open')""", rows,
     )
     return con.total_changes - before
 
@@ -204,120 +240,119 @@ def fill_entries(con, pair, tf_key, raw: pd.DataFrame) -> int:
     return filled
 
 
-def latest_model(con, pair, tf_key, kind) -> dict | None:
+# ---------------- 機械学習（メタラベリング） ----------------
+
+def latest_meta(con, pair, tf_key) -> dict | None:
     cur = con.execute(
-        "SELECT * FROM model_registry WHERE pair=? AND tf=? AND model=? AND horizon=? ORDER BY trained_at DESC LIMIT 1",
-        (pair, tf_key, kind, ML_HORIZON),
+        "SELECT * FROM model_registry WHERE pair=? AND tf=? AND model='meta' ORDER BY trained_at DESC LIMIT 1",
+        (pair, tf_key),
     )
     row = cur.fetchone()
     return dict(zip([c[0] for c in cur.description], row)) if row else None
 
 
-def retrain_due(reg: dict | None, ind: pd.DataFrame, every: int) -> bool:
-    if reg is None:
+def meta_retrain_due(reg: dict | None, ind: pd.DataFrame, every: int, n_trials: int) -> bool:
+    if reg is None or reg.get("eval_to") is None:
         return True
-    if reg.get("eval_to") is None:
-        return True  # 研究ノート反映前のモデル（条件を全期間のデータで判定していた）は、すぐに判定し直す
+    if (reg.get("n_trials") or 0) < n_trials:
+        return True  # 試した数が増えたら、DSR の割り引きをやり直す
     pos = int(ind.index.searchsorted(pd.Timestamp(reg["trained_bar"]), side="right"))
     return len(ind) - pos >= every
 
 
-def train_and_register(con, pair, tf_key, kind, ind, ind_dev, b, costs, pip, now) -> dict:
-    """条件の判定（検証）は開発用データだけで行い、本番モデルは同じ設定のまま最新データまで使って学習する。
-    開発用データは境界が固定なので変わらない。同じ設定・同じ期間の検証結果があれば使い回す。"""
+def train_meta(con, pair, tf_key, ind, ind_dev, b, costs, pip, now, n_trials: int) -> dict:
+    """条件の判定とモデルの選択は開発用データだけで行い（同じ期間・同じ試行数なら使い回す）、
+    本番モデルは選んだモデルの種類のまま、決着したすべてのラベルで学習する。"""
+    max_bars = VERTICAL_BARRIER[tf_key]
+    holdout.assert_dev_only(ind_dev, b)
     eval_to = ts_str(ind_dev.index[-1])
-    prev = con.execute(
-        """SELECT acc, majority_acc, logloss, base_logloss, trade_pips, beat, ok, eval_from FROM model_registry
-           WHERE pair=? AND tf=? AND model=? AND horizon=? AND eval_to=? ORDER BY trained_at DESC LIMIT 1""",
-        (pair, tf_key, kind, ML_HORIZON, eval_to),
-    ).fetchone()
-    if prev is None:
-        ev = ml.evaluate_model(ind_dev, tf_key, kind, ML_HORIZON, ML_THRESHOLD, RISK, costs, pip,
-                               holdout_start=b.start)
-        evald = dict(acc=ev.acc, majority_acc=ev.majority_acc, logloss=ev.logloss, base_logloss=ev.base_logloss,
-                     trade_pips=ev.trade_metrics["total"], beat=ev.beat, ok=int(ev.ok),
-                     eval_from=ts_str(ind_dev.index[int(ev.pred["i"].min())]))
-        trials.record(con, [ml.trial_row(ev, 5, 0.5)], pair=pair, tf=tf_key, origin="job", now=now,
-                      data_from=ind_dev.index[0], data_to=ind_dev.index[-1], n_bars=len(ind_dev))
+    cur = con.execute(
+        """SELECT kind, acc, majority_acc, logloss, base_logloss, trade_pips, beat, ok, eval_from, n_trials
+           FROM model_registry WHERE pair=? AND tf=? AND model='meta' AND eval_to=? AND threshold=?
+           ORDER BY trained_at DESC LIMIT 1""", (pair, tf_key, eval_to, ML_META_THRESHOLD))
+    prev = cur.fetchone()
+    if prev is not None and prev[-1] == n_trials:
+        evald = dict(zip([c[0] for c in cur.description], prev))
     else:
-        evald = dict(zip(["acc", "majority_acc", "logloss", "base_logloss", "trade_pips", "beat", "ok", "eval_from"], prev))
+        smp_dev = ml_eval.build_meta(ind_dev, tf_key, P, RISK, max_bars, costs.round_trip, pip)
+        rep = ml_eval.evaluate_all(smp_dev, ML_META_THRESHOLD, ML_META_FOLDS, runs=META_RANDOM_RUNS)
+        trials.record(con, rep.trials, pair=pair, tf=tf_key, origin="job", now=now,
+                      data_from=ind_dev.index[0], data_to=ind_dev.index[-1], n_bars=len(ind_dev))
+        n_now = n_trials
+        rep = ml_eval.finalize(rep, smp_dev, n_now)
+        ad = rep.results[rep.adopted]
+        evald = dict(kind=rep.adopted, acc=ad.acc, majority_acc=ad.majority_acc, logloss=ad.logloss,
+                     base_logloss=ad.base_logloss, trade_pips=ad.trade_metrics["total"], beat=ad.beat, ok=int(ad.ok),
+                     eval_from=ts_str(ind_dev.index[ad.folds[0][0]]), n_trials=n_now)
 
-    model, train_from, train_to = ml.fit_production(ind, tf_key, kind, ML_HORIZON)
-    version = f"{pair.replace('/', '')}_{tf_key}_{kind}_h{ML_HORIZON}_{now:%Y%m%d%H%M%S}"
+    smp = ml_eval.build_meta(ind, tf_key, P, RISK, max_bars, costs.round_trip, pip)  # 決着したラベルだけ
+    model = ml_eval.fit_production(smp, evald["kind"])
+    version = f"{pair.replace('/', '')}_{tf_key}_meta_{evald['kind']}_{now:%Y%m%d%H%M%S}"
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     path = MODELS_DIR / f"{version}.joblib"
     joblib.dump(model, path)
     reg = dict(
-        version=version, pair=pair, tf=tf_key, model=kind, horizon=ML_HORIZON, trained_at=ts_str(now),
-        trained_bar=ts_str(ind.index[-1]), trained_through=ts_str(train_to),
-        n_train=int(ind.index.searchsorted(train_to) - ind.index.searchsorted(train_from) + 1),
-        **evald, path=path.relative_to(ROOT).as_posix(), eval_to=eval_to, train_from=ts_str(train_from),
+        version=version, pair=pair, tf=tf_key, model="meta", horizon=max_bars, trained_at=ts_str(now),
+        trained_bar=ts_str(ind.index[-1]), trained_through=ts_str(ind.index[int(smp.t0.max())]), n_train=len(smp.y),
+        **evald, path=path.relative_to(ROOT).as_posix(), eval_to=eval_to,
+        train_from=ts_str(ind.index[int(smp.t0.min())]), mode="meta", threshold=ML_META_THRESHOLD,
     )
     con.execute(f"INSERT OR REPLACE INTO model_registry ({', '.join(reg)}) VALUES ({', '.join('?' * len(reg))})",
                 tuple(reg.values()))
     return reg
 
 
-def predict_and_log(con, pair, tf_key, kind, reg: dict, ind: pd.DataFrame, X: pd.DataFrame, now) -> int:
-    """学習に使った最後の足より後で、まだ記録していない足を予測する。初めて記録するときは最新の確定足だけ。"""
-    through = pd.Timestamp(reg["trained_through"])
-    last_logged = con.execute(
-        "SELECT MAX(bar_time) FROM prediction_log WHERE pair=? AND tf=? AND model=? AND horizon=?",
-        (pair, tf_key, kind, ML_HORIZON),
-    ).fetchone()[0]
-    n = len(ind)
-    if last_logged is None:
-        rows = [n - 1] if ind.index[-1] > through else []
-    else:
-        after = max(through, pd.Timestamp(last_logged))
-        rows = list(range(int(ind.index.searchsorted(after, side="right")), n))
-    Xv = X.to_numpy()
-    rows = [i for i in rows if not np.isnan(Xv[i]).any()]
+def judge_signals(con, pair, tf_key, reg: dict, ind: pd.DataFrame) -> int:
+    """まだ判定していない戦略のシグナルのうち、モデルを学習した時点の最新の足（trained_bar）以降のものを判定する。
+    それより前のシグナルは、判定の時点で使えなかったはずの情報で学習したモデルになるので判定しない。"""
+    rows = con.execute(
+        """SELECT id, source, signal_time, direction FROM signal_log
+           WHERE pair=? AND tf=? AND meta_p IS NULL AND entry_basis='next_open' AND source NOT LIKE 'ml_%'
+             AND signal_time >= ?""", (pair, tf_key, reg["trained_bar"]),
+    ).fetchall()
+    pos = {t: i for i, t in enumerate(ind.index)}
+    rows = [(rid, src, pos[pd.Timestamp(t)], d) for rid, src, t, d in rows if pd.Timestamp(t) in pos]
     if not rows:
         return 0
-
+    F = ml.make_features(ind, tf_key)
+    X = ml_eval.meta_features(F, np.array([r[2] for r in rows]), np.array([r[3] for r in rows]),
+                              np.array([r[1] for r in rows]))
+    ok = ~X.isna().any(axis=1).to_numpy()
+    if not ok.any():
+        return 0
     model = joblib.load(ROOT / reg["path"])
-    p = model.predict_proba(Xv[rows])[:, 1]
-    ok = bool(reg["ok"])
-    preds, sigs = [], []
-    close, atr = ind["close"].to_numpy(), ind["atr"].to_numpy()
-    for i, pi in zip(rows, p):
-        dec = ml.decide(float(pi), ok, ML_THRESHOLD)
-        preds.append((pair, tf_key, kind, ML_HORIZON, ts_str(ind.index[i]), float(pi), dec, reg["version"], ts_str(now)))
-        if dec in ("買い", "売り"):
-            d = 1 if dec == "買い" else -1
-            sigs.append((pair, tf_key, f"ml_{kind}", ts_str(ind.index[i]), d, float(atr[i]),
-                         ML_HORIZON, float(pi), None, ts_str(now)))
-    before = con.total_changes
-    con.executemany(
-        """INSERT OR IGNORE INTO prediction_log (pair, tf, model, horizon, bar_time, p, decision, version, logged_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", preds,
-    )
-    added = con.total_changes - before
-    _insert_signals(con, sigs)
-    return added
+    p = model.predict_proba(X.to_numpy()[ok])[:, 1]
+    threshold = reg.get("threshold") or ML_META_THRESHOLD
+    for (rid, *_), pi in zip([r for r, k in zip(rows, ok) if k], p):
+        con.execute("UPDATE signal_log SET meta_p=?, meta_decision=?, meta_version=? WHERE id=?",
+                    (float(pi), "乗る" if pi >= threshold else "見送り", reg["version"], rid))
+    return int(ok.sum())
 
+
+# ---------------- 戦略の判定（フェーズ2） ----------------
 
 def exit_rules(tf_key: str) -> bt.ExitRules:
     """トリプルバリア：利確・損切り（RISK）と、VERTICAL_BARRIER 本での時間切れ。反対シグナルでもドテン。"""
     return bt.ExitRules(opposite_exit=True, max_bars=VERTICAL_BARRIER[tf_key])
 
 
-def verdicts_due(con, pair, tf_key, ind_dev) -> bool:
-    """開発用データ（境界で固定）の最後の足で、DSR・PBO まで計算した判定がまだなければ計算する。"""
-    have = con.execute(
-        "SELECT COUNT(*) FROM backtest_verdicts WHERE pair=? AND tf=? AND bar_time=? AND n_trials IS NOT NULL",
-        (pair, tf_key, ts_str(ind_dev.index[-1]))).fetchone()[0]
-    return have < len(strategies.STRATEGIES)
+def verdicts_due(con, pair, tf_key, ind_dev, n_trials: int) -> bool:
+    """開発用データ（境界で固定）の最後の足で計算した判定がまだないか、試した数が増えて DSR の割り引きが古くなったら計算する。"""
+    rows = con.execute(
+        "SELECT n_trials FROM backtest_verdicts WHERE pair=? AND tf=? AND bar_time=? AND n_trials IS NOT NULL",
+        (pair, tf_key, ts_str(ind_dev.index[-1]))).fetchall()
+    if len(rows) < len(strategies.STRATEGIES):
+        return True
+    return min(r[0] for r in rows) < n_trials
 
 
-def save_verdicts(con, pair, tf_key, dev: pd.DataFrame, b, costs, pip, now) -> None:
+def save_verdicts(con, pair, tf_key, dev: pd.DataFrame, b, costs, pip, now, n_trials: int) -> None:
     """フェーズ2の評価（初期設定）を開発用データだけで行い、戦略ごとの判定を保存する（相場の解説で使う）。"""
-    rep = bt.evaluate_all(dev[["open", "high", "low", "close"]], P, RISK, exit_rules(tf_key), costs, pip, runs=100,
-                          holdout_start=b.start, rw_paths=20)
+    rep = bt.evaluate_all(dev[["open", "high", "low", "close"]], P, RISK, exit_rules(tf_key), costs, pip,
+                          runs=VERDICT_RANDOM_RUNS, holdout_start=b.start, rw_paths=VERDICT_RW_PATHS)
     trials.record(con, rep.trials, pair=pair, tf=tf_key, origin="job", now=now,
                   data_from=dev.index[0], data_to=dev.index[-1], n_bars=len(dev))
-    rep = bt.finalize(rep, trials.count(con, pair, tf_key))  # 記録済みの試行すべてで DSR を割り引く
+    rep = bt.finalize(rep, n_trials)  # この処理で試す予定の分を含めた、すべての試行の数で DSR を割り引く
     con.executemany(
         """INSERT OR REPLACE INTO backtest_verdicts
            (pair, tf, source, computed_at, bar_time, verdict, reason, wf_total, wf_beat, dsr, pbo, n_trials, wf_n)
@@ -331,6 +366,8 @@ def save_verdicts(con, pair, tf_key, dev: pd.DataFrame, b, costs, pip, now) -> N
 def _num(x) -> float | None:
     return None if x is None or (isinstance(x, float) and math.isnan(x)) else float(x)
 
+
+# ---------------- 答え合わせ ----------------
 
 def resolve_signals(con, pair, tf_key, ind, costs, pip) -> int:
     rows = con.execute(
@@ -354,6 +391,7 @@ def resolve_signals(con, pair, tf_key, ind, costs, pip) -> int:
 
 
 def fill_labels(con, pair, tf_key, ind) -> int:
+    """研究ノート反映前の方向予測（prediction_log）の答え合わせ。新しい予測はもう記録しない。"""
     rows = con.execute(
         "SELECT model, horizon, bar_time FROM prediction_log WHERE pair=? AND tf=? AND y IS NULL", (pair, tf_key)
     ).fetchall()

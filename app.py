@@ -7,8 +7,8 @@ from dashboard import backtest_tab, ml_tab, signals_tab, tracking_tab
 from dashboard.common import JST, Context
 from fxtool import data, indicators, jobs, tracking
 from fxtool.config import (
-    DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, PAIR_NAMES, PAIRS, TIMEFRAMES, IndicatorParams, RiskParams, pip_size,
-    price_digits,
+    DAILY_MAX_LOSS_R, DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, PAIR_NAMES, PAIRS, TIMEFRAMES, WEEKLY_MAX_LOSS_R,
+    IndicatorParams, RiskParams, pip_size, price_digits,
 )
 
 st.set_page_config(page_title="FXシグナル分析", page_icon="📈", layout="wide")
@@ -55,14 +55,19 @@ try:
     raw = data.load(con, pair, tf_key)
     fetched_at = data.last_fetch(con, pair, tf_key)
     boundary = data.boundary(con, pair, tf_key) if len(raw) >= 100 else None
-    # 戦略の重みは、フェーズ4で本番の記録にもとづく方法に作り直すまで停止中（以前の重みは最終テスト期間から計算していた）
-    weights: dict[str, float] = {}
+    # 戦略の重みは本番の記録から計算したもの（最終テスト期間のバックテストから計算していた以前の重みは使わない）
+    weights = {r.source: r.weight for r in tracking.latest_weights(con, pair, tf_key).itertuples()}
     active_alerts = tracking.load_alerts(con, pair, tf_key, active_only=True)
-    ml_status = tracking.latest_ml_status(con, pair, tf_key)
     verdicts = tracking.load_verdicts(con, pair, tf_key)
     usdjpy = data.latest_close(con, "USD/JPY")
+    signal_log = tracking.load_signal_log(con, pair, tf_key)
+    meta_model = jobs.latest_meta(con, pair, tf_key)
 finally:
     con.close()
+closed = signal_log[signal_log["status"].isin(tracking.DONE)]
+# 本番の記録は初期値の損切り幅（jobs.RISK）で記録しているので、左の設定ではなく初期値で R を計算する
+halt = tracking.loss_halt(closed, data.now_utc(), jobs.RISK.sl_atr, pip_size(ticker), DAILY_MAX_LOSS_R,
+                          WEEKLY_MAX_LOSS_R)
 
 if cyc.data_error:
     st.warning(f"データの更新に失敗したため、保存済みのデータで表示しています。（{cyc.data_error}）")
@@ -83,7 +88,8 @@ if n_conf < P.sma_long + P.atr_period:
     st.stop()
 
 ctx = Context(pair, ticker, tf_key, tf, pip_size(ticker), price_digits(ticker), P, risk, ind, n_conf, weights,
-              ml_status, active_alerts, verdicts, boundary, float(balance), float(risk_pct), usdjpy)
+              [], active_alerts, verdicts, boundary, float(balance), float(risk_pct), usdjpy,
+              signal_log=signal_log, meta_model=meta_model, halt=halt)
 
 with st.sidebar:
     st.divider()

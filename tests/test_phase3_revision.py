@@ -141,6 +141,23 @@ def test_build_meta_features_and_labels(random_walk):
     np.testing.assert_allclose(smp.X["ret_1_x_dir"], smp.X["ret_1"] * smp.X["dir"])
 
 
+def test_quantile_binner_reproduces_sklearn_binning():
+    """前処理つきの勾配ブースティングは、重みなしなら scikit-learn の勾配ブースティングと同じ予測になる
+    （区切りの計算を先にしているだけで、モデルは同じ）。"""
+    from sklearn.base import clone
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    rng = np.random.default_rng(0)
+    X = np.c_[rng.normal(size=(600, 3)), rng.integers(0, 2, 600), np.round(rng.normal(size=600), 1)]
+    y = (X[:, 0] + rng.normal(size=600) > 0).astype(float)
+    pipe = ml_eval.LADDER["gbm"][1]
+    raw = pipe.steps[-1][1]
+    a = clone(raw).fit(X, y).predict_proba(X)[:, 1]
+    b = clone(pipe).fit(X, y).predict_proba(X)[:, 1]
+    np.testing.assert_allclose(a, b)
+    binned = ml_eval.QuantileBinner().fit(X[:300]).transform(X[300:])
+    assert all(len(np.unique(binned[:, j])) <= 255 for j in range(X.shape[1]))
+
+
 # ---------------- モデルの段階的な比較 ----------------
 
 def fake_result(kind, total):

@@ -1,4 +1,4 @@
-"""タブ「記録と成績」（フェーズ4）。"""
+"""タブ「記録と成績」（フェーズ4。研究ノートを反映した改修版）。"""
 from __future__ import annotations
 
 import math
@@ -10,16 +10,18 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from fxtool import backtest as bt
-from fxtool import data, strategies, tracking
-from fxtool.config import ML_HORIZON, ML_THRESHOLD, TRACKING
+from fxtool import data, ml_eval, strategies, tracking
+from fxtool.config import (
+    DAILY_MAX_LOSS_R, LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, ML_HORIZON, TRACKING, WEEKLY_MAX_LOSS_R,
+)
 from fxtool.jobs import RISK
 
 from .common import JST, NEUTRAL_COLOR, STRATEGY_COLORS, Context, fmt_pct, fmt_pf, fmt_pips
 
 TASK_NAME = "FXSignalTool_Update"
-DONE = ["利確", "損切り", "期限"]
+DONE = list(tracking.DONE)
 SOURCE_NAMES = {s.key: s.name for s in strategies.STRATEGIES} | {
-    f"ml_{k}": f"機械学習（{v}）" for k, v in tracking.MODEL_NAMES.items()
+    f"ml_{k}": f"機械学習・旧方式（{v}）" for k, v in tracking.MODEL_NAMES.items()
 }
 SOURCE_COLORS = dict(zip(SOURCE_NAMES, STRATEGY_COLORS + ["#5d4037", "#455a64"]))
 
@@ -37,6 +39,18 @@ def jst(ts) -> str:
     return "—" if pd.isna(ts) else (pd.Timestamp(ts) + JST).strftime("%Y/%m/%d %H:%M")
 
 
+def summary_row(name: str, g: pd.DataFrame) -> dict:
+    done = g[g["status"].isin(DONE)].sort_values("exit_time")
+    m = bt.metrics(done["pips"])
+    return {
+        "対象": name, "記録件数": len(g),
+        "エントリー待ち": int((g["status"] == "待機").sum()), "進行中": int((g["status"] == "進行中").sum()),
+        "決済済み": f"{m['n']}" + ("（参考値）" if 0 < m["n"] < bt.MIN_TRADES_RELIABLE else ""),
+        "勝率": fmt_pct(m["win_rate"]), "損益合計(pips)": fmt_pips(m["total"]),
+        "平均(pips/回)": fmt_pips(m["avg"]), "PF": fmt_pf(m["pf"]), "最大DD(pips)": fmt_pips(m["max_dd"]),
+    }
+
+
 def render(ctx: Context) -> None:
     con = data.connect()
     try:
@@ -51,8 +65,9 @@ def render(ctx: Context) -> None:
     settings = TRACKING[ctx.tf_key]
 
     st.markdown(
-        "このツールが**実際に出したシグナルと予測**を記録し、その後どうなったかを自動で答え合わせしています。"
+        "このツールが**実際に出したシグナル**を記録し、その後どうなったかを自動で答え合わせしています。"
         "過去にさかのぼって作った記録ではないので、件数は使い続けるほど増えていきます。"
+        "**この本番の記録が、最も信頼できる最終テスト**です（開発中に見ていない、本当に未来のデータだからです）。"
     )
 
     # ---------------- 自動更新の状態 ----------------
@@ -93,66 +108,69 @@ def render(ctx: Context) -> None:
                 "レベル": past["level"].map({"critical": "重大", "warning": "注意"}), "内容": past["message"],
             }), hide_index=True, width="stretch")
 
-    # ---------------- 重み ----------------
-    period = "直近約1か月" if ctx.tf_key == "1h" else "直近約1年"
-    st.markdown("### ② 戦略の重み")
-    st.warning(
-        "**重みの計算は停止中です。** これまでの重みは、直近のバックテスト＝最終テスト期間のデータから計算していたため、"
-        "研究ノートの「最終テスト期間は使わない」に反していました。フェーズ4の改修で、本番の記録にもとづく方法に作り直します。"
-        "それまでは、すべての戦略を同じ重み（1.0）として扱います。以下は停止前の履歴です（参考）。"
+    # ---------------- 最大損失 ----------------
+    st.markdown("### ② 最大損失（1日・1週間）")
+    h = ctx.halt or tracking.Halt(False, "", 0.0, 0.0)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("今日の損益（日本時間）", f"{h.day_r:+.1f}R", help=f"上限 −{DAILY_MAX_LOSS_R:g}R")
+    c2.metric("今週の損益（月曜から）", f"{h.week_r:+.1f}R", help=f"上限 −{WEEKLY_MAX_LOSS_R:g}R")
+    c3.metric("新しいシグナル", "停止中" if h.active else "出しています")
+    if h.active:
+        st.error(h.reason)
+    n_supp = int(sl["suppressed"].sum()) if "suppressed" in sl else 0
+    st.caption(
+        f"1回の損切り幅を 1R（口座残高の約1%）として、本番の記録（全戦略）で決済した損益を合計しています。"
+        f"今日 −{DAILY_MAX_LOSS_R:g}R・今週 −{WEEKLY_MAX_LOSS_R:g}R に達したら、その期間は新しいシグナルを出さず、"
+        f"「停止中」として記録だけします（これまでに停止中に記録したシグナル：{n_supp}件）。"
     )
-    if wh.empty:
-        st.info("停止前の履歴はありません。")
+
+    # ---------------- 重み ----------------
+    st.markdown(f"### ③ 戦略の重み（本番の記録の直近{LIVE_WEIGHT_WINDOW}回から計算）")
+    live = wh[wh["basis"] == "live"] if "basis" in wh else wh.iloc[0:0]
+    if live.empty:
+        st.info("まだ計算されていません。")
     else:
-        latest = wh[wh["bar_time"] == wh["bar_time"].max()]
+        latest = live[live["bar_time"] == live["bar_time"].max()]
         st.dataframe(pd.DataFrame({
             "戦略": latest["source"].map(SOURCE_NAMES),
             "重み": latest["weight"].map(lambda v: f"{v:.2f}"),
-            "直近の取引回数": latest["recent_n"],
-            "直近の損益(pips)": latest["recent_pips"].map(fmt_pips),
-            "直近のPF": latest["recent_pf"].map(lambda v: fmt_pf(math.inf if pd.isna(v) else v)),
+            "決済済み（直近）": latest["recent_n"],
+            "損益(pips)": latest["recent_pips"].map(fmt_pips),
+            "PF": latest["recent_pf"].map(lambda v: fmt_pf(math.inf if pd.isna(v) else v)),
             "z値": latest["z"].map(lambda v: f"{v:+.2f}"),
         }), hide_index=True, width="stretch")
         st.caption(
-            "重み = 1 + 0.25 × z値（0.25〜1.75 に制限し、平均が1になるようそろえたもの）。z値は「1取引あたりの平均損益が0から"
-            "標準誤差いくつ分離れているか」で、取引が5回未満なら0（重み1）とします。"
-            "直近の成績を追いかけすぎないよう、意図的に控えめにしています。この重みは「現在のシグナル」タブの重み付き総合スコアに使います。"
+            "重み = 1 + 0.25 × z値（0.25〜1.75 に制限し、平均が1になるようそろえたもの）。z値は「1回あたりの平均損益が0から"
+            f"標準誤差いくつ分離れているか」で、決済済みが{LIVE_WEIGHT_MIN_TRADES}回未満の戦略は0（重み1）とします。"
+            "直近の成績を追いかけすぎないよう、意図的に控えめにしています。"
         )
-        if wh["bar_time"].nunique() > 1:
+        if live["bar_time"].nunique() > 1:
             fig = go.Figure()
-            for src, g in wh.groupby("source"):
+            for src, g in live.groupby("source"):
                 fig.add_trace(go.Scatter(x=ctx.to_display_time(pd.DatetimeIndex(g["bar_time"])), y=g["weight"],
                                          name=SOURCE_NAMES.get(src, src), line=dict(color=SOURCE_COLORS.get(src))))
             fig.add_hline(y=1, line=dict(color=NEUTRAL_COLOR, dash="dash", width=1))
-            fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="重み",
+            fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="重み",
                               legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
             st.plotly_chart(fig, width="stretch")
+    old = wh[wh["basis"] != "live"] if "basis" in wh else wh
+    if not old.empty:
+        st.caption(f"※ 以前の重み（{len(old)}件）は、直近のバックテスト＝最終テスト期間から計算していたため使っていません。")
 
     # ---------------- 記録したシグナル ----------------
-    st.markdown("### ③ 記録したシグナルの成績")
+    st.markdown("### ④ 記録したシグナルの成績")
     if sl.empty:
         st.info("まだシグナルは記録されていません。新しい足が確定してシグナルが出ると、ここに記録されます。")
     else:
-        rows = []
-        for src in SOURCE_NAMES:
-            g = sl[sl["source"] == src]
-            if g.empty:
-                continue
-            done = g[g["status"].isin(DONE)].sort_values("exit_time")
-            m = bt.metrics(done["pips"])
-            rows.append({
-                "戦略": SOURCE_NAMES[src], "記録件数": len(g),
-                "エントリー待ち": int((g["status"] == "待機").sum()), "進行中": int((g["status"] == "進行中").sum()),
-                "決済済み": m["n"], "勝率": fmt_pct(m["win_rate"]), "損益合計(pips)": fmt_pips(m["total"]),
-                "平均(pips/回)": fmt_pips(m["avg"]), "PF": fmt_pf(m["pf"]), "最大DD(pips)": fmt_pips(m["max_dd"]),
-            })
+        rows = [summary_row(SOURCE_NAMES.get(src, src), sl[sl["source"] == src]) for src in SOURCE_NAMES
+                if (sl["source"] == src).any()]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption(
             "エントリーはシグナルの次の足の始値（次の足が始まるまでは「待機」）、"
-            f"損切り・利確は ATR×{RISK.sl_atr:g}・ATR×{RISK.tp_atr:g}（左の設定ではなく初期値で固定）で記録し、"
-            f"{settings.log_max_bars}本経っても決着しなければその足の終値で「期限」（時間切れ）決済とします（機械学習は{ML_HORIZON}本）。"
-            "損益は取引コストを差し引いた値です。研究ノートにならい、決済済みが100回未満の成績は「参考値」として扱ってください。"
-            "なお、研究ノート反映前の記録（エントリーの基準が「シグナルの足の終値」）も含まれています。"
+            f"損切り・利確は ATR×{RISK.sl_atr:g}・ATR×{RISK.tp_atr:g}（左の設定ではなく初期値で固定）、"
+            f"{settings.log_max_bars}本で決着しなければ時間切れ（トリプルバリア）。損益は取引コストを差し引いた値です。"
+            f"研究ノートにならい、決済済みが{bt.MIN_TRADES_RELIABLE}回未満の成績は「参考値」です。"
+            "研究ノート反映前の記録（エントリーの基準が「シグナルの足の終値」）も含まれています。"
         )
         done = sl[sl["status"].isin(DONE)].sort_values("exit_time")
         if len(done) >= 2:
@@ -163,9 +181,16 @@ def render(ctx: Context) -> None:
                     name=SOURCE_NAMES.get(src, src), line=dict(color=SOURCE_COLORS.get(src), shape="hv"),
                 ))
             fig.add_hline(y=0, line=dict(color=NEUTRAL_COLOR, width=1))
-            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="累積損益（pips）",
+            fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="累積損益（pips）",
                               legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
             st.plotly_chart(fig, width="stretch")
+        mon = tracking.monthly(done)
+        if not mon.empty:
+            st.markdown("**月ごとの損益（pips・日本時間で決済した月）**")
+            mon = mon.rename(columns=SOURCE_NAMES).sort_index(ascending=False)
+            mon["合計"] = mon.sum(axis=1)
+            st.dataframe(mon.map(lambda v: "" if pd.isna(v) else f"{v:+,.1f}"), width="stretch")
+            st.caption("全期間の合計だけでなく、月ごとに崩れていないか（直近で悪化していないか）を確認してください。")
         with st.expander(f"記録の一覧（{len(sl)}件）"):
             t = sl.iloc[::-1]
             st.dataframe(pd.DataFrame({
@@ -176,72 +201,78 @@ def render(ctx: Context) -> None:
                 "損切り": t["sl"].map(ctx.fmt_price),
                 "利確": t["tp"].map(ctx.fmt_price),
                 "重み": t["weight"].map(lambda v: "—" if pd.isna(v) else f"{v:.2f}"),
-                "確率": t["prob"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}"),
+                "機械学習": [("—" if pd.isna(p) else f"{d}（{p:.0%}）") for p, d in zip(t["meta_p"], t["meta_decision"])],
+                "停止中": t["suppressed"].map({1: "停止中", 0: ""}),
                 "状況": t["status"].replace({"期限": "時間切れ", "待機": "エントリー待ち"}),
                 "エントリーの基準": t["entry_basis"].map({"next_open": "次の足の始値", "signal_close": "シグナルの足の終値（旧）"}),
-                "決済": [ "—" if pd.isna(x) else ctx.label(pd.Timestamp(x)) for x in t["exit_time"]],
+                "決済": ["—" if pd.isna(x) else ctx.label(pd.Timestamp(x)) for x in t["exit_time"]],
                 "損益(pips)": t["pips"].round(1),
             }), hide_index=True, width="stretch")
 
-    # ---------------- 機械学習 ----------------
-    st.markdown(f"### ④ 機械学習モデル（{ML_HORIZON}本後の方向、確信度 {ML_THRESHOLD:.0%}）")
-    if reg.empty:
+    render_meta(ctx, sl, reg, settings)
+    render_legacy(ctx, preds, reg)
+
+
+def render_meta(ctx: Context, sl: pd.DataFrame, reg: pd.DataFrame, settings) -> None:
+    st.markdown("### ⑤ 機械学習（メタラベリング：シグナルに乗るか見送るか）")
+    meta = reg[reg["model"] == "meta"]
+    if meta.empty:
         st.info("まだ学習されていません。")
         return
-    st.caption(f"{settings.retrain_every}本ごとに、新しいデータを含めて自動で再学習します。")
-    r = reg.iloc[::-1]
+    st.caption(f"{settings.retrain_every}本ごと（と、試した組み合わせの数が増えたとき）に自動で再学習します。"
+               "条件の判定とモデルの選択は開発用データだけで行い、本番モデルは選んだ設定のまま、決着したすべてのラベルで学習します。")
+    r = meta.iloc[::-1]
 
     def period(a, b) -> str:
-        return "—（旧：全期間で判定）" if pd.isna(a) else f"{ctx.label(pd.Timestamp(a))} 〜 {ctx.label(pd.Timestamp(b))}"
+        return f"{ctx.label(pd.Timestamp(a))} 〜 {ctx.label(pd.Timestamp(b))}"
 
     st.dataframe(pd.DataFrame({
         "学習日時": r["trained_at"].map(jst),
-        "モデル": r["model"].map(tracking.MODEL_NAMES),
+        "採用モデル": r["kind"].map(lambda k: ml_eval.LADDER[k][0] if k in ml_eval.LADDER else k),
         "条件の判定に使った期間（開発用）": [period(a, b) for a, b in zip(r["eval_from"], r["eval_to"])],
-        "本番モデルの学習期間": [period(a, b) if pd.notna(a) else f"〜 {ctx.label(pd.Timestamp(b))}"
-                         for a, b in zip(r["train_from"], r["trained_through"])],
-        "検証の正解率": r["acc"].map(lambda v: f"{v:.1%}"),
-        "基準（多い方）": r["majority_acc"].map(lambda v: f"{v:.1%}"),
+        "本番モデルの学習期間（決着したラベル）": [period(a, b) for a, b in zip(r["train_from"], r["trained_through"])],
+        "学習件数": r["n_train"],
         "検証の売買損益(pips)": r["trade_pips"].map(fmt_pips),
         "ランダムを上回った割合": r["beat"].map(fmt_pct),
-        "シグナルを出す条件": r["ok"].map({1: "✅ 満たす", 0: "❌ 満たさない"}),
+        "試した数": r["n_trials"].map(lambda v: "—" if pd.isna(v) else f"{int(v)}"),
+        "シグナルを出す条件": r["ok"].map({1: "✅ 満たす", 0: "❌ 満たさない（参考）"}),
     }), hide_index=True, width="stretch")
 
-    rows = []
-    fig = go.Figure()
-    for kind, name in tracking.MODEL_NAMES.items():
-        g = preds[(preds["model"] == kind) & (preds["horizon"] == ML_HORIZON)]
-        done = g.dropna(subset=["y"]).sort_values("bar_time")
-        n = len(done)
-        hit = ((done["p"] >= 0.5) == (done["y"] == 1)).astype(float)
-        acc = float(hit.mean()) if n else math.nan
-        rng = "—"
-        if n >= 10:
-            se = math.sqrt(acc * (1 - acc) / (n / ML_HORIZON))
-            rng = f"{acc - 1.96 * se:.1%} 〜 {acc + 1.96 * se:.1%}"
-        rows.append({"モデル": name, "予測した件数": len(g), "答え合わせ済み": n,
-                     "実際の正解率": "—" if not n else f"{acc:.1%}", "95%の範囲": rng,
-                     "シグナルを出した件数": int(g["decision"].isin(["買い", "売り"]).sum())})
-        if n >= 20:
-            w = min(50, n)
-            fig.add_trace(go.Scatter(x=ctx.to_display_time(pd.DatetimeIndex(done["bar_time"])),
-                                     y=hit.rolling(w).mean(), name=f"{name}（直近{w}件の正解率）",
-                                     line=dict(color=SOURCE_COLORS[f"ml_{kind}"])))
+    judged = sl[sl["meta_decision"].isin(["乗る", "見送り"])]
+    done = judged[judged["status"].isin(DONE)]
+    rows = [summary_row("乗ると判定したシグナル", judged[judged["meta_decision"] == "乗る"]),
+            summary_row("見送ると判定したシグナル", judged[judged["meta_decision"] == "見送り"]),
+            summary_row("判定したシグナル全体", judged)]
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption("「実際の正解率」は、学習に使っていない新しい足について記録した予測の答え合わせです。"
-               "数十件では誤差が大きいので、95%の範囲もあわせて見てください。")
-    if fig.data:
-        fig.add_hline(y=0.5, line=dict(color=NEUTRAL_COLOR, dash="dash", width=1))
-        fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis_tickformat=".0%",
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
-        st.plotly_chart(fig, width="stretch")
-    with st.expander(f"予測の記録（{len(preds)}件）"):
-        t = preds.iloc[::-1]
-        st.dataframe(pd.DataFrame({
-            "足": ctx.labels(pd.DatetimeIndex(t["bar_time"])),
-            "モデル": t["model"].map(tracking.MODEL_NAMES),
-            "上がる確率": t["p"].map(lambda v: f"{v:.1%}"),
-            "判断": t["decision"],
-            "結果": t["y"].map({1.0: "上がった", 0.0: "上がらなかった"}).fillna("答え合わせ待ち"),
-            "当たり": np.where(t["y"].isna(), "", np.where((t["p"] >= 0.5) == (t["y"] == 1), "○", "×")),
-        }), hide_index=True, width="stretch")
+    taken = done[done["meta_decision"] == "乗る"]["pips"]
+    skipped = done[done["meta_decision"] == "見送り"]["pips"]
+    if len(taken) and len(skipped):
+        diff = taken.mean() - skipped.mean()
+        st.caption(f"本番の記録では、乗ったシグナルの1回あたり損益が、見送ったシグナルより {diff:+.1f} pips "
+                   f"{'良い' if diff > 0 else '悪い'}結果です（決済済み {len(done)} 件。件数が少ないうちは偶然の影響が大きい）。")
+    else:
+        st.caption("「乗る」「見送り」の両方に決済済みのシグナルがたまると、見送りの効果を比べられます。")
+
+
+def render_legacy(ctx: Context, preds: pd.DataFrame, reg: pd.DataFrame) -> None:
+    old = reg[reg["model"] != "meta"]
+    if old.empty and preds.empty:
+        return
+    with st.expander(f"旧方式（{ML_HORIZON}本後の方向予測）の記録：研究ノート反映前のもので、今は記録していません"):
+        if not old.empty:
+            st.dataframe(pd.DataFrame({
+                "学習日時": old["trained_at"].map(jst),
+                "モデル": old["model"].map(tracking.MODEL_NAMES),
+                "検証の正解率": old["acc"].map(lambda v: f"{v:.1%}"),
+                "シグナルを出す条件": old["ok"].map({1: "✅", 0: "❌"}),
+            }), hide_index=True, width="stretch")
+        if not preds.empty:
+            t = preds.iloc[::-1]
+            st.dataframe(pd.DataFrame({
+                "足": ctx.labels(pd.DatetimeIndex(t["bar_time"])),
+                "モデル": t["model"].map(tracking.MODEL_NAMES),
+                "上がる確率": t["p"].map(lambda v: f"{v:.1%}"),
+                "判断": t["decision"],
+                "結果": t["y"].map({1.0: "上がった", 0.0: "上がらなかった"}).fillna("答え合わせ待ち"),
+                "当たり": np.where(t["y"].isna(), "", np.where((t["p"] >= 0.5) == (t["y"] == 1), "○", "×")),
+            }), hide_index=True, width="stretch")
