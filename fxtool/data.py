@@ -13,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
+from . import holdout
 from .config import DB_PATH, PERIOD_DAYS, TIMEFRAMES, Timeframe
 
 SCHEMA = """
@@ -38,11 +39,13 @@ TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     from .tracking import SCHEMA as TRACKING_SCHEMA
+    from .tracking import migrate
 
     path.parent.mkdir(parents=True, exist_ok=True)
     # 定期実行と画面が同時に書き込むことがあるので、ロック待ちを長めにする
     con = sqlite3.connect(path, timeout=30)
     con.executescript(SCHEMA + TRACKING_SCHEMA)
+    migrate(con)
     return con
 
 
@@ -88,6 +91,12 @@ def load(con: sqlite3.Connection, pair: str, tf_key: str) -> pd.DataFrame:
         con, params=(pair, tf_key), parse_dates=["ts"], index_col="ts",
     )
     return df
+
+
+def latest_close(con: sqlite3.Connection, pair: str) -> float | None:
+    """保存済みの最新の終値（時間足を問わない）。"""
+    row = con.execute("SELECT close FROM ohlc WHERE pair = ? ORDER BY ts DESC LIMIT 1", (pair,)).fetchone()
+    return float(row[0]) if row else None
 
 
 def count(con: sqlite3.Connection, pair: str, tf_key: str) -> int:
@@ -150,3 +159,47 @@ def confirmed(df: pd.DataFrame, tf: Timeframe, now: pd.Timestamp | None = None) 
     """確定済みの足だけを返す（足の開始時刻 + 足の長さ <= 現在時刻）。"""
     now = now_utc() if now is None else now
     return df[df.index + tf.bar <= now]
+
+
+# ---------------- 最終テスト期間（holdout.py） ----------------
+
+def boundary(con: sqlite3.Connection, pair: str, tf_key: str, now: pd.Timestamp | None = None,
+             path: Path | None = None) -> holdout.Boundary:
+    """最終テスト期間の境界。まだ決めていなければ、いま保存済みの確定足の直近20%で固定する。"""
+    b = holdout.get(pair, tf_key, path)
+    if b is not None:
+        return b
+    now = now_utc() if now is None else now
+    conf = confirmed(load(con, pair, tf_key), TIMEFRAMES[tf_key], now)
+    touched = holdout.TOUCHED_USDJPY if pair == "USD/JPY" else holdout.TOUCHED_UNKNOWN
+    return holdout.fix(pair, tf_key, conf, now, touched, path)
+
+
+def load_dev(con: sqlite3.Connection, pair: str, tf_key: str, now: pd.Timestamp | None = None,
+             path: Path | None = None) -> pd.DataFrame:
+    """開発用データ：確定足のうち、最終テスト期間より前の足だけ。戦略・設定・モデルを選ぶ処理は必ずこれを使う。"""
+    b = boundary(con, pair, tf_key, now, path)
+    return holdout.dev_part(confirmed(load(con, pair, tf_key), TIMEFRAMES[tf_key], now), b)
+
+
+# ---------------- データの品質 ----------------
+
+def quality(df: pd.DataFrame, tf: Timeframe) -> dict:
+    """タイムゾーン・週末・欠損まわりの確認用の集計（時刻は UTC）。"""
+    idx = df.index
+    s = idx.to_series()
+    out = {
+        "bars": len(df),
+        "duplicates": int(idx.duplicated().sum()),
+        "saturday": int((idx.dayofweek == 5).sum()),
+        "flat": int(((df["open"] == df["high"]) & (df["high"] == df["low"]) & (df["low"] == df["close"])).sum()),
+    }
+    if tf.key == "1h":
+        out["sunday_hours"] = sorted(set(idx[idx.dayofweek == 6].hour))
+        prev = s.shift()
+        weekend = (prev.dt.dayofweek == 4) & s.dt.dayofweek.isin([6, 0])
+        out["gaps"] = int(((s.diff() > tf.bar) & ~weekend).sum())  # 週末以外の空き（祝日の休場・欠損）
+    else:
+        out["sunday"] = int((idx.dayofweek == 6).sum())
+        out["not_midnight"] = int((idx.hour != 0).sum())
+    return out

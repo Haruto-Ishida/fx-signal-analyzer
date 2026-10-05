@@ -152,11 +152,36 @@ def directional_signals(p: np.ndarray, rows: np.ndarray, n: int, threshold: floa
     return sig.tolist()
 
 
+def fit_production(ind: pd.DataFrame, tf_key: str, kind: str, h: int) -> tuple[object, pd.Timestamp, pd.Timestamp]:
+    """本番用モデル：設定は固定したまま、答えのある最新の足まで使って学習する（研究ノートの例外として、
+    選ぶ判断には使わず、本番の予測だけに使う）。戻り値：(モデル, 学習に使った最初の足, 最後の足)。"""
+    X = make_features(ind, tf_key).to_numpy()
+    y = make_target(ind["close"], h).to_numpy()
+    valid = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
+    rows = np.flatnonzero(valid)
+    model = clone(MODELS[kind][1]).fit(X[rows], y[rows])
+    return model, ind.index[rows[0]], ind.index[rows[-1]]
+
+
+def trial_row(ev: "ModelEval", k: int, test_frac: float) -> dict:
+    from .trials import ml_config
+
+    return {"family": "ml", "name": ev.kind, "purpose": "ml_eval",
+            "config": ml_config(ev.kind, ev.horizon, ev.threshold, k=k, test_frac=test_frac),
+            "metrics": {"acc": ev.acc, "majority_acc": ev.majority_acc, "logloss": ev.logloss,
+                        "base_logloss": ev.base_logloss, "auc": ev.auc, "trade": ev.trade_metrics,
+                        "beat_random": ev.beat, "ok": ev.ok}}
+
+
 def evaluate_model(
     ind: pd.DataFrame, tf_key: str, kind: str, h: int, threshold: float, risk: RiskParams, costs: bt.Costs,
-    pip: float, k: int = 5, test_frac: float = 0.5, runs: int = 200,
+    pip: float, k: int = 5, test_frac: float = 0.5, runs: int = 200, holdout_start: pd.Timestamp | None = None,
 ) -> ModelEval:
-    """ind は確定足だけの指標付きデータ。"""
+    """ind は確定足だけの指標付きデータで、開発用（最終テスト期間より前）であること。
+    holdout_start を渡すと、それ以降の足が混ざっていたら止める。"""
+    if holdout_start is not None and len(ind) and ind.index[-1] >= holdout_start:
+        from .holdout import FinalTestAccessError
+        raise FinalTestAccessError(f"最終テスト期間（{holdout_start} 以降）のデータが機械学習の検証に渡されています")
     name, template = MODELS[kind]
     X_df = make_features(ind, tf_key)
     y_s = make_target(ind["close"], h)

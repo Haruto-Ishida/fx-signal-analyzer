@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
@@ -232,6 +232,7 @@ class Fold:
     train_metrics: dict
     test_trades: pd.DataFrame
     test_rate: float
+    candidate_metrics: list[dict] = field(default_factory=list)  # 学習区間での各候補の成績（PARAM_GRIDS の順）
 
 
 @dataclass
@@ -253,13 +254,15 @@ def walk_forward(
     folds = []
     for (a, b), (b2, c) in make_folds(len(raw), k, train_mult):
         best, best_m, best_score = cands[0], None, -math.inf
+        cand_ms = []
         for cand in cands:
             m = metrics([t[9] for t in simulate_raw(cand.bars, cand.sig, risk, rules, costs, pip, a, b)])
+            cand_ms.append(m)
             score = m["total"] if m["n"] >= min_trades else -math.inf
             if best_m is None or score > best_score:
                 best, best_m, best_score = cand, m, score
         test = simulate(best.bars, best.sig, risk, rules, costs, pip, b2, c)
-        folds.append(Fold((a, b), (b2, c), best.overrides, best_m, test, signal_rate(best.sig, b2, c)))
+        folds.append(Fold((a, b), (b2, c), best.overrides, best_m, test, signal_rate(best.sig, b2, c), cand_ms))
 
     test_trades = pd.concat([f.test_trades for f in folds], ignore_index=True)
     train_n = sum(f.train_metrics["n"] for f in folds)
@@ -292,12 +295,17 @@ class Report:
     baseline_random: pd.DataFrame    # 全戦略の平均頻度でのランダム売買
     baseline_curves: np.ndarray      # その累積損益の 5/50/95% 点
     k: int
+    trials: list[dict] = field(default_factory=list)  # 試行の記録用（trials.record に渡す）
 
 
 def evaluate_all(
     raw: pd.DataFrame, base: IndicatorParams, risk: RiskParams, rules: ExitRules, costs: Costs, pip: float,
-    runs: int = 200, k: int = 5, train_mult: int = 2,
+    runs: int = 200, k: int = 5, train_mult: int = 2, holdout_start: pd.Timestamp | None = None,
 ) -> Report:
+    """raw は開発用データ（最終テスト期間より前）。holdout_start を渡すと、それ以降の足が混ざっていたら止める。"""
+    if holdout_start is not None and len(raw) and raw.index[-1] >= holdout_start:
+        from .holdout import FinalTestAccessError
+        raise FinalTestAccessError(f"最終テスト期間（{holdout_start} 以降）のデータがバックテストに渡されています")
     cache: dict = {}
     ind = indicators.add_all(raw, base)
     cache[base] = ind
@@ -324,7 +332,25 @@ def evaluate_all(
     base_rand, curves = random_baseline(
         bars, [(WARMUP, n, float(np.mean(rates)))], risk, rules, costs, pip, runs, seed=999, curves=True
     )
-    return Report(WARMUP, reports, base_rand, curves, k)
+    return Report(WARMUP, reports, base_rand, curves, k, trial_rows(reports, base, risk, rules))
+
+
+def trial_rows(reports: list[StrategyReport], base: IndicatorParams, risk: RiskParams, rules: ExitRules) -> list[dict]:
+    """全期間（初期パラメータ）と、ウォークフォワードで試した全候補を、試行として記録する形にする。"""
+    from .trials import strategy_config
+
+    rows = []
+    for r in reports:
+        key = r.strategy.key
+        rows.append({"family": "strategy", "name": key, "purpose": "full_period",
+                     "config": strategy_config(key, base, risk, rules),
+                     "metrics": {**r.full_metrics, "beat_random": r.full_beat}})
+        for j, ov in enumerate(PARAM_GRIDS[key]):
+            rows.append({"family": "strategy", "name": key, "purpose": "wf_candidate",
+                         "config": strategy_config(key, replace(base, **ov), risk, rules),
+                         "metrics": {"train_total_by_fold": [f.candidate_metrics[j]["total"] for f in r.wf.folds],
+                                     "selected_folds": [i for i, f in enumerate(r.wf.folds) if f.overrides == ov]}})
+    return rows
 
 
 def assess(wf: WalkForwardResult, beat: float, k: int) -> tuple[str, str]:

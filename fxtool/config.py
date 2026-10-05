@@ -53,6 +53,16 @@ TIMEFRAMES = {
 PERIOD_DAYS = {"5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "5y": 1825, "730d": 730}
 
 
+# トリプルバリアの「時間切れ」：エントリーからこの本数で決着しなければ、その足の終値で決済する
+# （研究ノート 3。利確・損切り・時間切れの3つで決済をそろえる。バックテスト・画面・記録で共通）
+VERTICAL_BARRIER = {"1h": 48, "1d": 20}
+
+# ポジションサイズの目安（研究ノート 6）。1回の損失を口座残高のこの割合以内にする
+DEFAULT_BALANCE_JPY = 1_000_000
+DEFAULT_RISK_PCT = 1.0
+MIN_UNITS = 1_000  # 国内FX業者の一般的な最小取引単位
+
+
 @dataclass(frozen=True)
 class TrackingSettings:
     log_max_bars: int     # 記録したシグナルを最大何本で打ち切って評価するか
@@ -62,8 +72,8 @@ class TrackingSettings:
 
 
 TRACKING = {
-    "1h": TrackingSettings(log_max_bars=48, recent_bars=720, retrain_every=24, stale_bars=6),
-    "1d": TrackingSettings(log_max_bars=20, recent_bars=250, retrain_every=5, stale_bars=4),
+    "1h": TrackingSettings(log_max_bars=VERTICAL_BARRIER["1h"], recent_bars=720, retrain_every=24, stale_bars=6),
+    "1d": TrackingSettings(log_max_bars=VERTICAL_BARRIER["1d"], recent_bars=250, retrain_every=5, stale_bars=4),
 }
 
 # 定期実行で処理する通貨ペア

@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from fxtool.config import IndicatorParams, RiskParams, Timeframe
+from fxtool import holdout
+from fxtool.config import (
+    DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, VERTICAL_BARRIER, IndicatorParams, RiskParams, Timeframe,
+)
 
 JST = pd.Timedelta(hours=9)
 BUY_COLOR, SELL_COLOR, NEUTRAL_COLOR = "#26a69a", "#ef5350", "#9e9e9e"
@@ -29,10 +32,27 @@ class Context:
     ml_status: list = field(default_factory=list)            # 機械学習の最新の予測（フェーズ4）
     alerts: pd.DataFrame = field(default_factory=pd.DataFrame)    # 有効な警告
     verdicts: pd.DataFrame = field(default_factory=pd.DataFrame)  # 戦略の検証結果（フェーズ2の判定）
+    boundary: holdout.Boundary | None = None                 # 最終テスト期間の境界
+    balance_jpy: float = DEFAULT_BALANCE_JPY                 # ポジションサイズの目安用
+    risk_pct: float = DEFAULT_RISK_PCT
+    usdjpy: float | None = None                              # 円以外の通貨の損失を円に直すため
 
     @property
     def confirmed(self) -> pd.DataFrame:
+        """確定足すべて（本番の表示用）。"""
         return self.ind.iloc[: self.n_conf]
+
+    @property
+    def dev(self) -> pd.DataFrame:
+        """開発用データ：確定足のうち最終テスト期間より前。検証（バックテスト・機械学習）は必ずこれを使う。"""
+        if self.boundary is None:
+            raise holdout.FinalTestAccessError("最終テスト期間の境界が決まっていません")
+        return holdout.dev_part(self.confirmed, self.boundary)
+
+    @property
+    def max_bars(self) -> int:
+        """トリプルバリアの時間切れの本数。"""
+        return VERTICAL_BARRIER[self.tf_key]
 
     def label(self, ts: pd.Timestamp) -> str:
         """UTC の時刻を画面表示用（日本時間）の文字列にする。日足は日付のみ。"""

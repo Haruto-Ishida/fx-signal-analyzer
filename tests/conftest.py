@@ -8,6 +8,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+@pytest.fixture(autouse=True)
+def isolated_holdout_file(tmp_path, monkeypatch):
+    """テストが本物の holdout.json（最終テスト期間の境界）を書き換えないよう、必ず一時ファイルを使う。"""
+    from fxtool import holdout
+
+    monkeypatch.setattr(holdout, "HOLDOUT_FILE", tmp_path / "holdout.json")
+
+
 def make_ohlc(close, start="2025-01-01", freq="h", spread=0.05) -> pd.DataFrame:
     close = np.asarray(close, dtype=float)
     idx = pd.date_range(start, periods=len(close), freq=freq)

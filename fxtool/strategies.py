@@ -149,13 +149,19 @@ class StrategyView:
     atr: float | None
     outcome: Outcome | None
     unrealized: float | None            # 進行中の場合の含み損益（価格差、方向込み）
+    entry_fixed: bool = True            # False なら次の足がまだ始まっておらず、エントリーは見込み（シグナルの足の終値）
 
 
 def evaluate(
-    ind: pd.DataFrame, n_confirmed: int, strategy: Strategy, p: IndicatorParams, risk: RiskParams
+    ind: pd.DataFrame, n_confirmed: int, strategy: Strategy, p: IndicatorParams, risk: RiskParams,
+    max_bars: int | None = None,
 ) -> StrategyView:
-    """ind は未確定の足も含む指標付きデータ。シグナルは確定足だけで判定し、
-    損切り・利確に届いたかは未確定の足の値動きも含めて調べる。"""
+    """ind は未確定の足も含む指標付きデータ。シグナルは確定足だけで判定する。
+
+    エントリーはシグナルの次の足の始値（研究ノート 2-1：終値で判断したものを同じ終値では売買できない）。
+    次の足がまだ始まっていなければ、シグナルの足の終値を「見込み」として使う。
+    決済はトリプルバリア（利確・損切り・max_bars 本での時間切れ）。未確定の足の値動きも含めて調べる。
+    """
     sig = signals(ind, strategy, p, n_confirmed)
     hits = np.flatnonzero(sig.to_numpy() != 0)
     if len(hits) == 0:
@@ -163,15 +169,17 @@ def evaluate(
 
     i = int(hits[-1])
     direction = int(sig.iat[i])
-    entry = float(ind["close"].iat[i])
+    entry_fixed = i + 1 < len(ind)
+    entry = float(ind["open"].iat[i + 1]) if entry_fixed else float(ind["close"].iat[i])
     atr = float(ind["atr"].iat[i])
     sl, tp = levels(entry, direction, atr, risk)
-    outcome = resolve_trade(ind, i, direction, sl, tp)
+    # i+1 本目の始値で入るので、i+1 本目の値動きから調べる（resolve_trade は i の次の足から見る）
+    outcome = resolve_trade(ind, i, direction, sl, tp, max_bars)
     bars_ago = n_confirmed - 1 - i
     unrealized = direction * (float(ind["close"].iat[-1]) - entry) if outcome.status == "進行中" else None
 
     active = outcome.status == "進行中" and bars_ago < risk.valid_bars
     decision = ("買い" if direction > 0 else "売り") if active else "様子見"
     return StrategyView(
-        strategy, decision, direction, ind.index[i], bars_ago, entry, sl, tp, atr, outcome, unrealized
+        strategy, decision, direction, ind.index[i], bars_ago, entry, sl, tp, atr, outcome, unrealized, entry_fixed
     )

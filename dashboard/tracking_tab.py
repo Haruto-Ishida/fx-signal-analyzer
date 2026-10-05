@@ -17,6 +17,7 @@ from fxtool.jobs import RISK
 from .common import JST, NEUTRAL_COLOR, STRATEGY_COLORS, Context, fmt_pct, fmt_pf, fmt_pips
 
 TASK_NAME = "FXSignalTool_Update"
+DONE = ["利確", "損切り", "期限"]
 SOURCE_NAMES = {s.key: s.name for s in strategies.STRATEGIES} | {
     f"ml_{k}": f"機械学習（{v}）" for k, v in tracking.MODEL_NAMES.items()
 }
@@ -94,9 +95,14 @@ def render(ctx: Context) -> None:
 
     # ---------------- 重み ----------------
     period = "直近約1か月" if ctx.tf_key == "1h" else "直近約1年"
-    st.markdown(f"### ② 戦略の重み（{period}＝{settings.recent_bars}本の成績から計算）")
+    st.markdown("### ② 戦略の重み")
+    st.warning(
+        "**重みの計算は停止中です。** これまでの重みは、直近のバックテスト＝最終テスト期間のデータから計算していたため、"
+        "研究ノートの「最終テスト期間は使わない」に反していました。フェーズ4の改修で、本番の記録にもとづく方法に作り直します。"
+        "それまでは、すべての戦略を同じ重み（1.0）として扱います。以下は停止前の履歴です（参考）。"
+    )
     if wh.empty:
-        st.info("まだ計算されていません。")
+        st.info("停止前の履歴はありません。")
     else:
         latest = wh[wh["bar_time"] == wh["bar_time"].max()]
         st.dataframe(pd.DataFrame({
@@ -132,21 +138,23 @@ def render(ctx: Context) -> None:
             g = sl[sl["source"] == src]
             if g.empty:
                 continue
-            done = g[g["status"] != "進行中"].sort_values("exit_time")
+            done = g[g["status"].isin(DONE)].sort_values("exit_time")
             m = bt.metrics(done["pips"])
             rows.append({
-                "戦略": SOURCE_NAMES[src], "記録件数": len(g), "進行中": int((g["status"] == "進行中").sum()),
+                "戦略": SOURCE_NAMES[src], "記録件数": len(g),
+                "エントリー待ち": int((g["status"] == "待機").sum()), "進行中": int((g["status"] == "進行中").sum()),
                 "決済済み": m["n"], "勝率": fmt_pct(m["win_rate"]), "損益合計(pips)": fmt_pips(m["total"]),
                 "平均(pips/回)": fmt_pips(m["avg"]), "PF": fmt_pf(m["pf"]), "最大DD(pips)": fmt_pips(m["max_dd"]),
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption(
-            f"エントリーはシグナルが出た足の終値、損切り・利確は ATR×{RISK.sl_atr:g}・ATR×{RISK.tp_atr:g}"
-            "（左の設定ではなく初期値で固定）で記録し、"
-            f"{settings.log_max_bars}本経っても決着しなければその足の終値で「期限」決済とします（機械学習は{ML_HORIZON}本）。"
-            "損益は取引コストを差し引いた値です。決済済みが20回程度になるまでは、成績はほぼ偶然で決まると考えてください。"
+            "エントリーはシグナルの次の足の始値（次の足が始まるまでは「待機」）、"
+            f"損切り・利確は ATR×{RISK.sl_atr:g}・ATR×{RISK.tp_atr:g}（左の設定ではなく初期値で固定）で記録し、"
+            f"{settings.log_max_bars}本経っても決着しなければその足の終値で「期限」（時間切れ）決済とします（機械学習は{ML_HORIZON}本）。"
+            "損益は取引コストを差し引いた値です。研究ノートにならい、決済済みが100回未満の成績は「参考値」として扱ってください。"
+            "なお、研究ノート反映前の記録（エントリーの基準が「シグナルの足の終値」）も含まれています。"
         )
-        done = sl[sl["status"] != "進行中"].sort_values("exit_time")
+        done = sl[sl["status"].isin(DONE)].sort_values("exit_time")
         if len(done) >= 2:
             fig = go.Figure()
             for src, g in done.groupby("source"):
@@ -169,7 +177,8 @@ def render(ctx: Context) -> None:
                 "利確": t["tp"].map(ctx.fmt_price),
                 "重み": t["weight"].map(lambda v: "—" if pd.isna(v) else f"{v:.2f}"),
                 "確率": t["prob"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}"),
-                "状況": t["status"],
+                "状況": t["status"].replace({"期限": "時間切れ", "待機": "エントリー待ち"}),
+                "エントリーの基準": t["entry_basis"].map({"next_open": "次の足の始値", "signal_close": "シグナルの足の終値（旧）"}),
                 "決済": [ "—" if pd.isna(x) else ctx.label(pd.Timestamp(x)) for x in t["exit_time"]],
                 "損益(pips)": t["pips"].round(1),
             }), hide_index=True, width="stretch")
@@ -181,10 +190,16 @@ def render(ctx: Context) -> None:
         return
     st.caption(f"{settings.retrain_every}本ごとに、新しいデータを含めて自動で再学習します。")
     r = reg.iloc[::-1]
+
+    def period(a, b) -> str:
+        return "—（旧：全期間で判定）" if pd.isna(a) else f"{ctx.label(pd.Timestamp(a))} 〜 {ctx.label(pd.Timestamp(b))}"
+
     st.dataframe(pd.DataFrame({
         "学習日時": r["trained_at"].map(jst),
         "モデル": r["model"].map(tracking.MODEL_NAMES),
-        "学習データの最後": ctx.labels(pd.DatetimeIndex(r["trained_through"])),
+        "条件の判定に使った期間（開発用）": [period(a, b) for a, b in zip(r["eval_from"], r["eval_to"])],
+        "本番モデルの学習期間": [period(a, b) if pd.notna(a) else f"〜 {ctx.label(pd.Timestamp(b))}"
+                         for a, b in zip(r["train_from"], r["trained_through"])],
         "検証の正解率": r["acc"].map(lambda v: f"{v:.1%}"),
         "基準（多い方）": r["majority_acc"].map(lambda v: f"{v:.1%}"),
         "検証の売買損益(pips)": r["trade_pips"].map(fmt_pips),

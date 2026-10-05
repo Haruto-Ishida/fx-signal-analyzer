@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from conftest import make_path_ohlc
-from fxtool import data, jobs, strategies, tracking
+from fxtool import data, holdout, jobs, strategies, tracking, trials
 from fxtool.config import ML_HORIZON, IndicatorParams
 
 PAIR, TF = "USD/JPY", "1h"
@@ -48,11 +48,23 @@ def test_first_cycle_trains_and_logs_only_latest(world):
     preds = tracking.load_predictions(world.con, PAIR, TF)
     assert len(preds) == 2  # 各モデル、最新の確定足の1件だけ
     assert (preds["bar_time"] == FULL.index[1499]).all()
-    assert len(tracking.latest_weights(world.con, PAIR, TF)) == len(strategies.STRATEGIES)
+    # 重みは最終テスト期間から計算することになるため停止中（フェーズ4で作り直す）
+    assert tracking.latest_weights(world.con, PAIR, TF).empty
     sl = tracking.load_signal_log(world.con, PAIR, TF)
     assert (sl["signal_time"] == FULL.index[1499]).all()  # 過去にさかのぼって記録しない
     v = tracking.load_verdicts(world.con, PAIR, TF)
     assert r.verdicts_updated and sorted(v["source"]) == sorted(s.key for s in strategies.STRATEGIES)
+
+    # 最終テスト期間：直近20%で固定。検証（判定）はそれより前だけ、本番モデルは最新まで
+    b = holdout.get(PAIR, TF)
+    assert b.start == FULL.index[int(1500 * 0.8)] and b.n_bars_at_fix == 1500
+    assert (v["bar_time"] < b.start).all()
+    reg = tracking.load_registry(world.con, PAIR, TF)
+    assert (reg["eval_to"] < b.start).all() and (reg["eval_from"] < reg["eval_to"]).all()
+    assert (reg["trained_through"] >= FULL.index[1499 - ML_HORIZON]).all()
+    assert (reg["train_from"] < b.start).all()
+    # 試した組み合わせが記録されている（推定の過去分 + 今回の判定の分）
+    assert trials.count(world.con, PAIR, TF, origin="job") == 37 + 2
     ml_status = tracking.latest_ml_status(world.con, PAIR, TF)
     assert {m.model for m in ml_status} == {"logistic", "gbm"}
     assert all(m.bar_time == FULL.index[1499] for m in ml_status)
@@ -86,6 +98,17 @@ def test_new_bars_are_predicted_by_the_old_model_before_retraining(world):
     assert len(new) == 60
     for k in ("logistic", "gbm"):
         assert (new.loc[new["model"] == k, "version"] == v1[k]).all()
+
+
+def test_legacy_model_is_rejudged_on_dev_data_immediately(world):
+    world.cycle()
+    world.con.execute("UPDATE model_registry SET eval_to=NULL, eval_from=NULL")  # 反映前の形を再現
+    world.con.commit()
+    world.advance(1)
+    r = world.cycle()
+    assert sorted(r.retrained) == ["gbm", "logistic"]
+    latest = tracking.load_registry(world.con, PAIR, TF).tail(2)
+    assert latest["eval_to"].notna().all()
 
 
 def test_strategy_signals_logged_exactly_once(world):

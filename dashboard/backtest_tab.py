@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from fxtool import backtest as bt
+from fxtool import data, trials
 from fxtool.config import DEFAULT_SLIPPAGE, DEFAULT_SPREAD, IndicatorParams, RiskParams
 
 from .common import NEUTRAL_COLOR, STRATEGY_COLORS, Context, fmt_pct, fmt_pf, fmt_pips
@@ -14,9 +15,36 @@ VERDICT_ICONS = {"有望（要継続監視）": "🟢", "偶然の範囲": "🟡
 
 
 @st.cache_data(show_spinner=False, max_entries=6)
-def run(ohlc: pd.DataFrame, params: IndicatorParams, risk: RiskParams, rules: bt.ExitRules, costs: bt.Costs,
-        pip: float, runs: int, k: int, train_mult: int) -> bt.Report:
-    return bt.evaluate_all(ohlc, params, risk, rules, costs, pip, runs, k, train_mult)
+def run(pair: str, tf_key: str, ohlc: pd.DataFrame, params: IndicatorParams, risk: RiskParams, rules: bt.ExitRules,
+        costs: bt.Costs, pip: float, runs: int, k: int, train_mult: int, holdout_start: pd.Timestamp) -> bt.Report:
+    """開発用データだけで評価し、試した組み合わせを記録する（同じ設定はキャッシュされ、二重に記録しない）。"""
+    rep = bt.evaluate_all(ohlc, params, risk, rules, costs, pip, runs, k, train_mult, holdout_start=holdout_start)
+    con = data.connect()
+    try:
+        trials.record(con, rep.trials, pair=pair, tf=tf_key, origin="dashboard", now=data.now_utc(),
+                      data_from=ohlc.index[0], data_to=ohlc.index[-1], n_bars=len(ohlc))
+    finally:
+        con.close()
+    return rep
+
+
+def holdout_notice(ctx: Context) -> None:
+    """検証に使う期間と、使わない最終テスト期間を表示する。"""
+    b = ctx.boundary
+    dev = ctx.dev
+    con = data.connect()
+    try:
+        n_trials = trials.count(con, ctx.pair, ctx.tf_key)
+    finally:
+        con.close()
+    st.info(
+        f"🔒 **検証に使う期間（開発用データ）**：{ctx.label(dev.index[0])} 〜 {ctx.label(dev.index[-1])}（{len(dev):,}本）。"
+        f"**{ctx.label(b.start)} 以降は最終テスト期間**として、検証には一切使いません"
+        f"（{b.fixed_at:%Y/%m/%d} に固定。それ以降の本番の記録を、最も信頼できる最終テストとして扱います）。  \n"
+        f"⚠️ {b.touched}  \n"
+        f"これまでに試した組み合わせ（この通貨ペア・時間足）：**{n_trials} 通り**"
+        "（研究ノート反映前の推定分を含む。試すほど、どれかが偶然よく見える可能性が高まります）。"
+    )
 
 
 def metric_row(name: str, m: dict, beat: str = "—") -> dict:
@@ -43,7 +71,10 @@ def render(ctx: Context) -> None:
                                    key=f"spread_{ctx.pair}")
         slip = c[1].number_input("スリッページ（片道, pips）", 0.0, 10.0, DEFAULT_SLIPPAGE, 0.1, key="slippage",
                                  help="注文した価格と実際に約定する価格のずれ。エントリーと決済の両方でかかるとみなします。")
-        max_bars = c[2].number_input("最大保有本数（0 = 制限なし）", 0, 2000, 0, 10)
+        max_bars = c[2].number_input(
+            "時間切れ（本。0 = 制限なし）", 0, 2000, ctx.max_bars, 1, key=f"max_bars_{ctx.tf_key}",
+            help="トリプルバリアの「時間切れ」。エントリーからこの本数で利確・損切りに届かなければ、その足の終値で決済します。",
+        )
         opposite = c[3].checkbox("反対シグナルでドテン", True,
                                  help="持っているポジションと逆のシグナルが出たら、決済して逆方向に入り直します。")
         d = st.columns(3)
@@ -55,18 +86,21 @@ def render(ctx: Context) -> None:
             f"1回の取引のコスト：{spread + 2 * slip:.1f} pips（スプレッド + スリッページ×2）。スワップポイントは含みません。"
         )
 
+    holdout_notice(ctx)
     if not st.session_state.get("bt_on"):
         if st.button("▶ バックテストを実行", type="primary"):
             st.session_state["bt_on"] = True
             st.rerun()
-        st.info("計算には1時間足で10秒前後かかります。一度実行すると、以後は設定を変えるたびに自動で再計算します。")
+        st.info("計算には1時間足で10秒前後かかります。一度実行すると、以後は設定を変えるたびに自動で再計算します。"
+                "設定を変えて実行するたびに、試した組み合わせとして記録されます。")
         return
 
-    conf = ctx.confirmed
+    conf = ctx.dev  # 最終テスト期間より前だけ
     rules = bt.ExitRules(opposite_exit=opposite, max_bars=int(max_bars))
     costs = bt.Costs(spread, slip)
     with st.spinner("バックテスト中…（初回は10秒前後かかります）"):
-        rep = run(conf[["open", "high", "low", "close"]], ctx.params, ctx.risk, rules, costs, ctx.pip, runs, k, train_mult)
+        rep = run(ctx.pair, ctx.tf_key, conf[["open", "high", "low", "close"]], ctx.params, ctx.risk, rules, costs,
+                  ctx.pip, runs, k, train_mult, ctx.boundary.start)
 
     n = len(conf)
     t_disp = ctx.to_display_time(conf.index)
@@ -82,8 +116,8 @@ def render(ctx: Context) -> None:
             "これらのシグナルだけに従って売買しても、長期的に利益が出るとは言えません。"
         )
 
-    # ---------------- 全期間 ----------------
-    st.markdown(f"### ① 全期間の成績（初期パラメータ）　{ctx.label(conf.index[rep.start])} 〜 {ctx.label(conf.index[-1])}")
+    # ---------------- 開発用データ全体 ----------------
+    st.markdown(f"### ① 開発用データ全体の成績（初期パラメータ）　{ctx.label(conf.index[rep.start])} 〜 {ctx.label(conf.index[-1])}")
     rows = [metric_row(r.strategy.name, r.full_metrics, fmt_pct(r.full_beat)) for r in rep.reports]
     rows.append(metric_row("何もしない", bt.metrics([])) | {"損益合計(pips)": "±0.0", "最大DD(pips)": "±0.0"})
     b = rep.baseline_random
@@ -101,7 +135,7 @@ def render(ctx: Context) -> None:
     st.caption(
         "「ランダムを上回った割合」は、その戦略と同じ頻度でランダムに売買した試行（決済ルール・コストは同じ）のうち、"
         "損益合計で上回った割合です。95%以上なら偶然では出にくい成績と言えます。"
-        "なお、この表は全期間のデータを見たうえで決めた初期パラメータでの結果なので、実力より良く見えている可能性があります。"
+        "なお、初期パラメータは一般的によく使われる値ですが、過去のデータを見たうえでの結果なので、実力より良く見えている可能性があります。"
     )
 
     fig = go.Figure()
@@ -181,7 +215,7 @@ def render(ctx: Context) -> None:
         } for i, f in enumerate(r.wf.folds)]), hide_index=True, width="stretch")
         st.caption("パラメータの候補：" + "、".join(bt.describe_params(key, ov) for ov in bt.PARAM_GRIDS[key]))
 
-    with st.expander("取引の一覧（全期間・初期パラメータ）"):
+    with st.expander("取引の一覧（開発用データ全体・初期パラメータ）"):
         key = st.selectbox("戦略", keys, format_func=name_of, key="trade_list")
         t = by_key[key].full_trades
         if t.empty:

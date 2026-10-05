@@ -6,14 +6,15 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from fxtool import commentary, data, strategies, tracking
+from fxtool import commentary, data, sizing, strategies, tracking
+from fxtool.config import MIN_UNITS
 
 from .common import BUY_COLOR, NEUTRAL_COLOR, SELL_COLOR, Context, color_decision
 
 
 def render(ctx: Context) -> None:
     P, risk, ind, n_conf, pip, digits = ctx.params, ctx.risk, ctx.ind, ctx.n_conf, ctx.pip, ctx.digits
-    views = [strategies.evaluate(ind, n_conf, s, P, risk) for s in strategies.STRATEGIES]
+    views = [strategies.evaluate(ind, n_conf, s, P, risk, ctx.max_bars) for s in strategies.STRATEGIES]
     last_c = ind.iloc[n_conf - 1]
 
     # ---------------- 相場の解説（フェーズ5） ----------------
@@ -44,6 +45,9 @@ def render(ctx: Context) -> None:
     if ctx.weights:
         st.caption("重み付き総合スコアは、各戦略の判断（買い +1・売り −1・様子見 0）を、直近の成績で決めた重みで平均したもの（−1〜+1）です。"
                    "どの戦略にもはっきりした優位性は確認できていないので、あくまで判断の目安です。")
+    else:
+        st.caption("戦略の重み付けは停止中です（以前の重みは最終テスト期間のデータから計算していたため。"
+                   "フェーズ4の改修で、本番の記録にもとづく方法に作り直します）。")
 
     # ---------------- 戦略ごとのシグナル ----------------
     def status_text(v: strategies.StrategyView) -> str:
@@ -53,7 +57,18 @@ def render(ctx: Context) -> None:
         if o.status == "進行中":
             return f"進行中（{v.unrealized / pip:+.1f} pips）"
         pips = v.direction * (o.exit_price - v.entry) / pip
-        return f"{o.status}に到達 {ctx.label(o.exit_time)}（{pips:+.1f} pips）"
+        name = "時間切れ" if o.status == "期限" else o.status
+        return f"{name}に到達 {ctx.label(o.exit_time)}（{pips:+.1f} pips）"
+
+    def size_text(v: strategies.StrategyView) -> str:
+        if v.decision not in ("買い", "売り"):
+            return "—"
+        s = sizing.position_size(ctx.balance_jpy, ctx.risk_pct, v.entry, v.sl, ctx.ticker, ctx.usdjpy)
+        if s is None:
+            return "円換算できません"
+        if s.units == 0:
+            return s.note
+        return f"{s.units:,}通貨（損切り時 −{s.loss_at_stop_jpy:,.0f}円）"
 
     rows = []
     for v in views:
@@ -62,20 +77,24 @@ def render(ctx: Context) -> None:
             "戦略": v.strategy.name,
             "タイプ": v.strategy.kind,
             "判断": v.decision,
-            "重み": f"{ctx.weights[v.strategy.key]:.2f}" if v.strategy.key in ctx.weights else "—",
             "直近のシグナル": f"{'買い' if v.direction > 0 else '売り'}　{ctx.label(v.signal_time)}" if has else "なし",
             "何本前": v.bars_ago if has else None,
-            "エントリー目安": ctx.fmt_price(v.entry),
+            "エントリー（次の足の始値）": (ctx.fmt_price(v.entry) + ("" if v.entry_fixed else "（見込み）")) if has else "—",
             "損切り": f"{ctx.fmt_price(v.sl)}（{-risk.sl_atr * v.atr / pip:.1f} pips）" if has else "—",
             "利確": f"{ctx.fmt_price(v.tp)}（+{risk.tp_atr * v.atr / pip:.1f} pips）" if has else "—",
+            "数量の目安": size_text(v),
             "その後の状況": status_text(v),
         })
     st.dataframe(pd.DataFrame(rows).style.map(color_decision, subset=["判断"]), hide_index=True, width="stretch")
     st.caption(
-        f"シグナルは確定した足だけで判定します（未確定の足では出しません）。エントリー目安はシグナルが出た足の終値、"
-        f"損切りは ATR×{risk.sl_atr:g}、利確は ATR×{risk.tp_atr:g} です。シグナルから {risk.valid_bars} 本以内で、"
-        "まだ損切り・利確に届いていないものを「買い／売り」、それ以外を「様子見」としています。"
+        "シグナルは確定した足だけで判定します（未確定の足では出しません）。"
+        "エントリーはシグナルの**次の足の始値**です（次の足がまだ始まっていない間は、シグナルの足の終値を「見込み」として表示）。"
+        f"決済は**トリプルバリア**：損切り ATR×{risk.sl_atr:g}、利確 ATR×{risk.tp_atr:g}、"
+        f"{ctx.max_bars}本で決着しなければ時間切れ。シグナルから {risk.valid_bars} 本以内で、"
+        "まだ決着していないものを「買い／売り」、それ以外を「様子見」としています。"
         "1本の足の中で損切りと利確の両方に届いた場合は、損切りが先とみなしています。"
+        f"数量の目安は、損切りになったときの損失が口座残高 {ctx.balance_jpy:,.0f}円 の {ctx.risk_pct:g}% 以内に収まる数量です"
+        f"（{MIN_UNITS:,}通貨単位で切り捨て。注文はしません）。"
     )
 
     # ---------------- チャート ----------------

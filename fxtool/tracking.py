@@ -18,13 +18,33 @@ CREATE TABLE IF NOT EXISTS signal_log (
     pair TEXT NOT NULL, tf TEXT NOT NULL, source TEXT NOT NULL,
     signal_time TEXT NOT NULL,
     direction INTEGER NOT NULL,
-    entry REAL NOT NULL, sl REAL NOT NULL, tp REAL NOT NULL, atr REAL NOT NULL,
+    entry REAL, sl REAL, tp REAL,     -- 次の足の始値がわかるまでは NULL（status = '待機'）
+    atr REAL NOT NULL,
     max_bars INTEGER NOT NULL,
     prob REAL, weight REAL,
     logged_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT '進行中',
+    status TEXT NOT NULL DEFAULT '待機',
     exit_time TEXT, exit_price REAL, pips REAL,
+    entry_basis TEXT NOT NULL DEFAULT 'next_open',  -- next_open / signal_close（研究ノート反映前の記録）
     UNIQUE (pair, tf, source, signal_time)
+);
+CREATE TABLE IF NOT EXISTS trials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    pair TEXT NOT NULL, tf TEXT NOT NULL,
+    family TEXT NOT NULL,          -- strategy / ml
+    name TEXT NOT NULL,            -- 戦略のキー、またはモデルの種類
+    purpose TEXT NOT NULL,         -- full_period / wf_candidate / ml_eval など
+    config TEXT NOT NULL,          -- 設定（JSON）
+    config_hash TEXT NOT NULL,     -- 同じ設定かどうかの判定用
+    data_from TEXT, data_to TEXT, n_bars INTEGER,
+    metrics TEXT,                  -- 結果（JSON）
+    origin TEXT NOT NULL,          -- dashboard / job / retroactive など
+    note TEXT
+);
+CREATE TABLE IF NOT EXISTS final_test_access (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair TEXT NOT NULL, tf TEXT NOT NULL, accessed_at TEXT NOT NULL, reason TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS prediction_log (
     pair TEXT NOT NULL, tf TEXT NOT NULL, model TEXT NOT NULL, horizon INTEGER NOT NULL,
@@ -43,7 +63,9 @@ CREATE TABLE IF NOT EXISTS model_registry (
     n_train INTEGER NOT NULL,
     acc REAL, majority_acc REAL, logloss REAL, base_logloss REAL, trade_pips REAL, beat REAL,
     ok INTEGER NOT NULL,
-    path TEXT NOT NULL
+    path TEXT NOT NULL,
+    eval_from TEXT, eval_to TEXT,    -- 条件の判定（検証）に使った期間：開発用データのみ
+    train_from TEXT                  -- 本番モデルの学習に使った期間の始め（終わりは trained_through）
 );
 CREATE TABLE IF NOT EXISTS weight_history (
     pair TEXT NOT NULL, tf TEXT NOT NULL, bar_time TEXT NOT NULL, source TEXT NOT NULL,
@@ -78,6 +100,31 @@ TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 def ts_str(ts: pd.Timestamp) -> str:
     return pd.Timestamp(ts).strftime(TS_FMT)
+
+
+def _columns(con: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+
+
+def migrate(con: sqlite3.Connection) -> None:
+    """古い形式の DB を新しい形式にそろえる（何度呼んでもよい）。"""
+    cols = _columns(con, "signal_log")
+    if "entry_basis" not in cols:
+        # 研究ノート反映前の記録：エントリーはシグナルの足の終値。entry 等を NULL 可にするため作り直す
+        con.execute("ALTER TABLE signal_log RENAME TO signal_log_old")
+        con.executescript(SCHEMA)
+        old_cols = ", ".join(c for c in [
+            "id", "pair", "tf", "source", "signal_time", "direction", "entry", "sl", "tp", "atr", "max_bars",
+            "prob", "weight", "logged_at", "status", "exit_time", "exit_price", "pips"])
+        con.execute(f"INSERT INTO signal_log ({old_cols}, entry_basis) SELECT {old_cols}, 'signal_close' FROM signal_log_old")
+        con.execute("DROP TABLE signal_log_old")
+    reg_cols = _columns(con, "model_registry")
+    for c in ("eval_from", "eval_to", "train_from"):
+        if c not in reg_cols:
+            con.execute(f"ALTER TABLE model_registry ADD COLUMN {c} TEXT")
+    from .trials import seed_retroactive
+    seed_retroactive(con)
+    con.commit()
 
 
 def get_state(con: sqlite3.Connection, pair: str, tf: str, key: str) -> str | None:
@@ -291,7 +338,7 @@ def load_predictions(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFram
 def load_registry(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
     df = pd.read_sql_query(
         "SELECT * FROM model_registry WHERE pair=? AND tf=? ORDER BY trained_at", con, params=(pair, tf),
-        parse_dates=["trained_at", "trained_bar", "trained_through"],
+        parse_dates=["trained_at", "trained_bar", "trained_through", "eval_from", "eval_to", "train_from"],
     )
     return _numeric(df, ["acc", "majority_acc", "logloss", "base_logloss", "trade_pips", "beat"])
 

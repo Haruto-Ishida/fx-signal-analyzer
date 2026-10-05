@@ -8,16 +8,25 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from fxtool import backtest as bt
-from fxtool import ml
-from fxtool.config import DEFAULT_SLIPPAGE, DEFAULT_SPREAD, RiskParams
+from fxtool import data, ml, trials
+from fxtool.config import DEFAULT_SLIPPAGE, DEFAULT_SPREAD, ML_HORIZON, ML_THRESHOLD, RiskParams
 
 from .common import BUY_COLOR, NEUTRAL_COLOR, SELL_COLOR, Context, fmt_pct, fmt_pf, fmt_pips
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
-def run(ind: pd.DataFrame, tf_key: str, kind: str, h: int, threshold: float, risk: RiskParams, costs: bt.Costs,
-        pip: float, k: int) -> ml.ModelEval:
-    return ml.evaluate_model(ind, tf_key, kind, h, threshold, risk, costs, pip, k=k)
+def run(pair: str, ind: pd.DataFrame, tf_key: str, kind: str, h: int, threshold: float, risk: RiskParams,
+        costs: bt.Costs, pip: float, k: int, holdout_start: pd.Timestamp) -> ml.ModelEval:
+    """開発用データだけで検証し、試した設定を記録する（同じ設定はキャッシュされ、二重に記録しない）。"""
+    ev = ml.evaluate_model(ind, tf_key, kind, h, threshold, risk, costs, pip, k=k, holdout_start=holdout_start)
+    con = data.connect()
+    try:
+        trials.record(con, [ml.trial_row(ev, k, 0.5)], pair=pair, tf=tf_key, origin="dashboard", now=data.now_utc(),
+                      data_from=ind.index[0], data_to=ind.index[-1], n_bars=len(ind))
+    finally:
+        con.close()
+    ev.model = None  # 画面では使わない（キャッシュを軽くする）
+    return ev
 
 
 def horizon_label(tf_key: str, h: int) -> str:
@@ -47,18 +56,23 @@ def render(ctx: Context) -> None:
             f"利確 ATR×{ctx.risk.tp_atr:g}、保有は最大 {h} 本。"
         )
 
+    dev = ctx.dev
+    st.info(
+        f"🔒 検証は開発用データ（{ctx.label(dev.index[0])} 〜 {ctx.label(dev.index[-1])}）だけで行います。"
+        f"{ctx.label(ctx.boundary.start)} 以降の最終テスト期間は使いません。"
+    )
     if not st.session_state.get("ml_on"):
         if st.button("▶ 学習して検証する", type="primary"):
             st.session_state["ml_on"] = True
             st.rerun()
-        st.info("1時間足で数秒〜10秒ほどかかります。一度実行すると、以後は設定を変えるたびに自動で再計算します。")
+        st.info("1時間足で数秒〜10秒ほどかかります。一度実行すると、以後は設定を変えるたびに自動で再計算します。"
+                "設定を変えて実行するたびに、試した組み合わせとして記録されます。")
         return
 
-    conf = ctx.confirmed
     with st.spinner("学習・検証しています…"):
-        evals = {kk: run(conf, ctx.tf_key, kk, h, threshold, ctx.risk, costs, ctx.pip, k) for kk in ml.MODELS}
+        evals = {kk: run(ctx.pair, dev, ctx.tf_key, kk, h, threshold, ctx.risk, costs, ctx.pip, k, ctx.boundary.start)
+                 for kk in ml.MODELS}
     ev = evals[kind]
-    dec = ml.decision(ev)
 
     # ---------------- 判定と現在の予測 ----------------
     if ev.ok:
@@ -78,14 +92,23 @@ def render(ctx: Context) -> None:
     for name, passed, detail in ev.checks:
         st.markdown(f"{'✅' if passed else '❌'} **{name}** — {detail}")
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric(f"{horizon_label(ctx.tf_key, h)}に上がる確率", "—" if math.isnan(ev.current_p) else f"{ev.current_p:.1%}")
-    m2.metric("シグナル", dec)
-    m3.metric("予測の基準にした足", ctx.label(ev.current_time))
-    if not ev.ok:
-        st.caption("確率は参考値です。上の条件を満たしていないため、売買の判断には使わないでください。")
+    # 現在の予測は、本番モデル（設定を固定し、最新データまで使って学習したもの）の記録から表示する
+    prod = next((m for m in ctx.ml_status if m.model == kind), None)
+    if h == ML_HORIZON and abs(threshold - ML_THRESHOLD) < 1e-9 and prod is not None:
+        m1, m2, m3 = st.columns(3)
+        m1.metric(f"{horizon_label(ctx.tf_key, h)}に上がる確率（本番モデル）", f"{prod.p:.1%}")
+        m2.metric("シグナル", prod.decision)
+        m3.metric("予測の基準にした足", ctx.label(prod.bar_time))
+        st.caption(
+            "本番モデルは、この設定のまま最新データまで使って学習し直したものです（最終テスト期間も学習に含みますが、"
+            "設定を選ぶ判断には使っていません）。本番モデルの実力は「記録と成績」タブの本番の記録で評価します。"
+            + ("" if prod.ok else " 開発用データでの検証で条件を満たしていないため、確率は参考値です。売買の判断には使わないでください。")
+        )
     else:
-        st.caption(f"確率が {threshold:.0%} 以上で買い、{1 - threshold:.0%} 以下で売り、その間は様子見です。")
+        st.caption(
+            f"現在の予測は、本番で使っている設定（{horizon_label(ctx.tf_key, ML_HORIZON)}・確信度 {ML_THRESHOLD:.0%}）のときだけ表示します。"
+            "ここで設定を変えて検証した結果は、試した組み合わせとして記録されますが、本番の予測には使いません。"
+        )
 
     # ---------------- 正解率の比較 ----------------
     st.markdown(f"### ① 方向の正解率（検証期間 {ev.n:,} 件）")
@@ -152,7 +175,7 @@ def render(ctx: Context) -> None:
     with g2:
         st.markdown("**区間ごとの正解率**")
         fig = go.Figure()
-        xs = [f"区間{i + 1}<br>{ctx.label(ctx.confirmed.index[f.test[0]])[:10]}〜" for i, f in enumerate(ev.folds)]
+        xs = [f"区間{i + 1}<br>{ctx.label(dev.index[f.test[0]])[:10]}〜" for i, f in enumerate(ev.folds)]
         fig.add_trace(go.Bar(x=xs, y=[f.acc for f in ev.folds], name=ev.name, marker_color="#2962ff"))
         fig.add_trace(go.Bar(x=xs, y=[f.majority_acc for f in ev.folds], name="多い方を予測", marker_color=NEUTRAL_COLOR))
         fig.add_hline(y=0.5, line=dict(color=SELL_COLOR, dash="dot", width=1))
@@ -175,7 +198,8 @@ def render(ctx: Context) -> None:
         st.markdown(
             f"- **学習と検証の分け方**：データの後半50%を {k} 区間に分け、各区間の予測には**それより前のデータだけ**で学習したモデルを使います。"
             f"学習データの最後の {h} 本は答えが検証期間の値動きを含むので、学習から外しています（パージ）。\n"
-            "- **現在の予測**：答えがわかっている全期間で学習し直したモデルで、最新の確定足について予測しています。\n"
+            "- **現在の予測**：本番モデル（本番の設定のまま、答えがわかっている最新の足まで使って学習し直したもの）の予測です。"
+            "どのデータでどのモデルを作ったかは「記録と成績」タブのモデルの履歴に残しています。\n"
             "- **特徴量**：" + "、".join(ml.feature_label(c) for c in ev.importance.index) + "。"
             "値幅に関するものは ATR で割って、時期が違っても比べられるようにしています。時間帯は UTC 基準です。\n"
             "- **ハイパーパラメータは固定**です。検証結果を見ながら調整すると、それ自体が過去への合わせ込みになるためです。\n"

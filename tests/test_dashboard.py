@@ -28,7 +28,10 @@ def db(tmp_path, monkeypatch):
 def ctx():
     df = make_path_ohlc(600, seed=21)
     ind = indicators.add_all(df, IndicatorParams())
-    return Context(PAIR, "AUDJPY=X", TF, TIMEFRAMES[TF], 0.01, 3, IndicatorParams(), RiskParams(), ind, len(ind) - 1)
+    from fxtool import holdout
+    b = holdout.Boundary(PAIR, TF, ind.index[480], pd.Timestamp("2026-10-05"), 599, "テスト")
+    return Context(PAIR, "AUDJPY=X", TF, TIMEFRAMES[TF], 0.01, 3, IndicatorParams(), RiskParams(), ind, len(ind) - 1,
+                   boundary=b)
 
 
 def add_signal(con, t, source="macd_cross", status="進行中", pips=None, exit_time=None):
@@ -46,8 +49,11 @@ def add_prediction(con, t, y=None):
         "INSERT INTO prediction_log VALUES (?, ?, 'gbm', 1, ?, 0.55, 'シグナルなし', 'v1', ?, ?)", (PAIR, TF, t, t, y)
     )
     con.execute(
-        """INSERT OR IGNORE INTO model_registry VALUES ('v1', ?, ?, 'gbm', 1, ?, ?, ?, 100,
-           0.53, 0.52, 0.69, 0.69, -10, 0.5, 0, 'data/models/v1.joblib')""", (PAIR, TF, t, t, t),
+        """INSERT OR IGNORE INTO model_registry
+           (version, pair, tf, model, horizon, trained_at, trained_bar, trained_through, n_train,
+            acc, majority_acc, logloss, base_logloss, trade_pips, beat, ok, path, eval_from, eval_to, train_from)
+           VALUES ('v1', ?, ?, 'gbm', 1, ?, ?, ?, 100, 0.53, 0.52, 0.69, 0.69, -10, 0.5, 0, 'data/models/v1.joblib',
+                   '2026-01-01 00:00:00', '2026-06-01 00:00:00', '2024-01-01 00:00:00')""", (PAIR, TF, t, t, t),
     )
     con.commit()
 
@@ -78,6 +84,53 @@ def test_tracking_tab_mixed_signals_and_predictions(db, ctx):
 def test_tracking_tab_only_unlabeled_predictions(db, ctx):
     add_prediction(db, "2026-10-05 08:00:00")
     tracking_tab.render(ctx)
+
+
+def test_tracking_tab_waiting_entry_and_legacy_rows(db, ctx):
+    """エントリー待ち（entry が NULL）と、研究ノート反映前の記録が混ざった状態。"""
+    db.execute(
+        """INSERT INTO signal_log (pair, tf, source, signal_time, direction, atr, max_bars, logged_at, status, entry_basis)
+           VALUES (?, ?, 'ma_cross', '2026-10-05 09:00:00', -1, 0.2, 48, '2026-10-05 10:00:00', '待機', 'next_open')""",
+        (PAIR, TF),
+    )
+    add_signal(db, "2026-10-05 01:00:00", status="期限", pips=3.2, exit_time="2026-10-07 01:00:00")
+    db.execute("UPDATE signal_log SET entry_basis='signal_close' WHERE status='期限'")
+    db.commit()
+    sl = tracking.load_signal_log(db, PAIR, TF)
+    assert sl["entry"].isna().sum() == 1 and sl["entry"].dtype == float
+    tracking_tab.render(ctx)
+
+
+def test_backtest_and_ml_tabs_use_dev_data_only(db, ctx, monkeypatch):
+    """検証タブは、最終テスト期間より前のデータだけを計算に渡す。"""
+    import streamlit as st
+
+    from dashboard import backtest_tab, ml_tab
+    from fxtool import holdout
+
+    ctx.boundary = holdout.Boundary(PAIR, TF, ctx.ind.index[400], pd.Timestamp("2026-10-05"), 500, "テスト")
+    seen = {}
+
+    def fake_bt(*args, **kw):
+        seen["bt"] = (args[2].index[-1], args[-1])  # 3番目が開発用データ、最後が最終テスト期間の始まり
+        raise RuntimeError("stop")
+
+    def fake_ml(pair, ind, *args, **kw):
+        seen["ml"] = (ind.index[-1], args[-1])
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(backtest_tab, "run", fake_bt)
+    monkeypatch.setattr(ml_tab, "run", fake_ml)
+    st.session_state["bt_on"] = st.session_state["ml_on"] = True
+    try:
+        for tab in (backtest_tab, ml_tab):
+            with pytest.raises(RuntimeError, match="stop"):
+                tab.render(ctx)
+    finally:
+        st.session_state.clear()
+    for last, start in seen.values():
+        assert last < ctx.boundary.start == start
+    assert set(seen) == {"bt", "ml"}
 
 
 def test_signals_tab_with_and_without_tracking_data(db, ctx):
