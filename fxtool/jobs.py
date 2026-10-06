@@ -170,6 +170,8 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
     res.signals_logged = log_strategy_signals(con, pair, tf_key, ind, {r.source: r.weight for r in live}, now,
                                               suppressed=bool(stop_reasons), reason=" ／ ".join(stop_reasons),
                                               max_per_day=s.signal_cap(pair), event_filter=s.event_filter)
+    # 戦略のチャレンジャー（シャドーモード）：出ていたはずのシグナルを shadow=1 で記録するだけ（本番には使わない）
+    mlops.shadow_strategies(con, pair, tf_key, ind, P, now)
     fill_entries(con, pair, tf_key, raw)
 
     # この処理で試す予定の設定も含めた「試した数」。戦略の判定と機械学習の条件を、同じ数で割り引く
@@ -194,6 +196,7 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
     if retrain:
         mlops.shadow_cycle(con, pair, tf_key, ind, RISK, P, costs, pip, now)
         mlops.review(con, pair, tf_key, ind_dev, b, P, RISK, costs, pip, now, n_trials)
+        mlops.review_strategies(con, pair, tf_key, now)
 
     if retrain and verdicts_due(con, pair, tf_key, ind_dev, n_trials):
         save_verdicts(con, pair, tf_key, holdout.dev_part(conf, b), b, costs, pip, now, n_trials)
@@ -214,9 +217,10 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
         conds.append(tracking.Condition("risk", f"kill_{t.kind}", "critical", "キルスイッチ：" + t.reason))
     ch = mlops.challengers(con, pair, tf_key)
     for c in ch[ch["status"] == "ready"].itertuples():
+        label = mlops.SPECS[c.spec].label if c.spec in mlops.SPECS else mlops.strategy_label(c)
         conds.append(tracking.Condition("ml_meta", f"challenger_{c.id}", "warning",
-                                        f"機械学習：チャレンジャー「{mlops.SPECS[c.spec].label}」が入れ替えの条件を満たしました。"
-                                        "「機械学習予測」タブで確認して、承認するか決めてください"))
+                                        f"チャレンジャー「{label}」が入れ替え（追加）の条件を満たしました。"
+                                        "「機械学習予測」タブの「本番モデルの管理」で確認して、承認するか決めてください"))
     if mlops.pinned_version(con, pair, tf_key):
         conds.append(tracking.Condition("ml_meta", "pinned", "warning",
                                         f"機械学習：前のバージョン（{mlops.pinned_version(con, pair, tf_key)}）に戻して固定しています。"
@@ -376,7 +380,7 @@ def judge_signals(con, pair, tf_key, reg: dict, ind: pd.DataFrame) -> int:
     それより前のシグナルは、判定の時点で使えなかったはずの情報で学習したモデルになるので判定しない。"""
     rows = con.execute(
         """SELECT id, source, signal_time, direction FROM signal_log
-           WHERE pair=? AND tf=? AND meta_p IS NULL AND entry_basis='next_open' AND source NOT LIKE 'ml_%'
+           WHERE pair=? AND tf=? AND meta_p IS NULL AND entry_basis='next_open' AND source NOT LIKE 'ml_%' AND shadow=0
              AND signal_time >= ?""", (pair, tf_key, reg["trained_bar"]),
     ).fetchall()
     pos = {t: i for i, t in enumerate(ind.index)}

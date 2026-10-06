@@ -152,3 +152,15 @@ def render(ctx: Context) -> None:
                     + f"\n- DSR：{'—' if pd.isna(c.dsr) else f'{c.dsr:.0%}'}、PBO：{'—' if pd.isna(c.pbo) else f'{c.pbo:.0%}'}"
                     + ("\n- 年ごとの損益（検証区間）：" + "、".join(f"{y}年 {v:+,.0f}" for y, v in yearly.items()) if yearly else "")
                 )
+                if not str(c.verdict).startswith("無効") and st.button(
+                        "🧪 この戦略をチャレンジャーとして試運転する（シャドーモード）", key=f"shadow_strategy_{c.run_id}_{c.rank}",
+                        help="本番には使わず、出ていたはずのシグナルを記録して、これからの相場で確かめます。試行数は増えません。"):
+                    from fxtool import mlops
+                    con = data.connect()
+                    try:
+                        mlops.register_strategy(con, ctx.pair, ctx.tf_key, json.loads(c.genes), data.now_utc())
+                        st.success("シャドーモードで始めました。「🤖 機械学習予測」タブの「本番モデルの管理」で状況を確認できます。")
+                    except ValueError as e:
+                        st.warning(str(e))
+                    finally:
+                        con.close()

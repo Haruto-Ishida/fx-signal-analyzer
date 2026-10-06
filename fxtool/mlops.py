@@ -154,7 +154,7 @@ def shadow_cycle(con, pair, tf, ind: pd.DataFrame, risk: RiskParams, p, costs, p
     """シャドーモードのチャレンジャーを（必要なら）再学習し、新しいシグナルを判定して記録する。シグナルには使わない。
     戻り値：判定したシグナルの数。"""
     ch = challengers(con, pair, tf)
-    ch = ch[ch["status"].isin(["shadow", "ready"])]
+    ch = ch[ch["status"].isin(["shadow", "ready"]) & (ch["kind"] != "strategy")]   # 機械学習のチャレンジャーだけ
     judged = 0
     every = TRACKING[tf].retrain_every
     for c in ch.itertuples():
@@ -185,7 +185,7 @@ def _judge_shadow(con, cid, pair, tf, reg, ind, spec, now) -> int:
     start = max(reg["trained_bar"], con.execute("SELECT created_at FROM challengers WHERE id=?", (cid,)).fetchone()[0])
     rows = con.execute(
         """SELECT id, source, signal_time, direction FROM signal_log s
-           WHERE pair=? AND tf=? AND entry_basis='next_open' AND source NOT LIKE 'ml_%' AND signal_time >= ?
+           WHERE pair=? AND tf=? AND entry_basis='next_open' AND source NOT LIKE 'ml_%' AND shadow=0 AND signal_time >= ?
              AND NOT EXISTS (SELECT 1 FROM shadow_judgments j WHERE j.challenger_id=? AND j.signal_id=s.id)""",
         (pair, tf, start, cid)).fetchall()
     pos = {t: i for i, t in enumerate(ind.index)}
@@ -316,9 +316,16 @@ def update_status(con, pair, tf, cid: int, cmp: Comparison, now: pd.Timestamp) -
 def approve(con, pair, tf, cid: int, now: pd.Timestamp) -> None:
     """ユーザーの承認：本番の設定をチャレンジャーの設定に切り替える。次の定期処理で、新しい設定の本番モデルを学習する。
     それまでは今の本番モデルを使う。前のバージョンには画面から戻せる。"""
-    row = con.execute("SELECT spec, status FROM challengers WHERE id=? AND pair=? AND tf=?", (cid, pair, tf)).fetchone()
+    row = con.execute("SELECT spec, status, kind FROM challengers WHERE id=? AND pair=? AND tf=?", (cid, pair, tf)).fetchone()
     if row is None or row[1] != "ready":
         raise ValueError("入れ替えの提案中のチャレンジャーではありません")
+    if row[2] == "strategy":
+        # 戦略の追加は、本番の画面・口座・機械学習の特徴量など広い範囲に関わるので、承認の記録だけ残し、
+        # 本番への組み込みは、あなたと確認しながら行う（自動では組み込まない）
+        con.execute("UPDATE challengers SET status='approved', decided_at=?, note=? WHERE id=?",
+                    (ts_str(now), "承認済み。本番への組み込みは Claude と確認しながら行う", cid))
+        con.commit()
+        return
     tracking.set_state(con, pair, tf, "meta_spec", row[0])
     tracking.set_state(con, pair, tf, "meta_pin", "")
     con.execute("UPDATE challengers SET status='approved', decided_at=? WHERE id=?", (ts_str(now), cid))
@@ -335,6 +342,7 @@ def review(con, pair, tf, ind_dev, b, p, risk, costs, pip, now: pd.Timestamp, n_
     開発用データでの検証は重いので、ほかの条件をすべて満たしたときだけ、1日1回まで行う。"""
     out = []
     ch = challengers(con, pair, tf)
+    ch = ch[ch["kind"] != "strategy"]   # 戦略のチャレンジャーは review_strategies
     for c in ch[ch["status"].isin(["shadow", "ready"])].itertuples():
         ls = last_swap(con, pair, tf)
         cmp = compare(con, c.id, now, last_swap=ls)
@@ -350,4 +358,131 @@ def review(con, pair, tf, ind_dev, b, p, risk, costs, pip, now: pd.Timestamp, n_
         if update_status(con, pair, tf, c.id, cmp, now):
             out.append(f"チャレンジャー「{SPECS[c.spec].label}」が、入れ替えの条件を満たしました（シャープレシオ "
                        f"{cmp.sr_chal:+.2f} ＞ 本番 {cmp.sr_champ:+.2f}）。「機械学習予測」タブで確認して、承認するか決めてください")
+    return out
+
+
+# ---------------- 戦略のチャレンジャー（2026-10-07） ----------------
+# 全通りの評価などで見つかった戦略の候補を、本番には使わずに「出ていたはずのシグナル」として記録し（signal_log の shadow=1）、
+# 本番と同じ方法で答え合わせをする。本番の画面・ペーパー口座・キルスイッチ・通知・重み・機械学習には使わない。
+
+STRATEGY_BASELINE = "ma_cross"   # 比べる相手：最初からある「移動平均クロス」（いちばん近い形の本番の戦略）
+
+
+def register_strategy(con, pair, tf, genes: dict, now: pd.Timestamp, note: str = "") -> int:
+    """戦略の候補をシャドーモードで始める。全通りの評価で試した設定そのものなので、試行数は増えない。"""
+    import json
+    from . import ga_jobs
+    genome = ga_jobs.genome_from_genes(genes)         # 作れない組み合わせなら ValueError
+    from . import ga
+    key = ga.key_of(genome)
+    ch = challengers(con, pair, tf)
+    if len(ch) and ((ch["spec"] == key) & ch["status"].isin(["shadow", "ready"])).any():
+        raise ValueError("同じ戦略がすでにシャドーモード中です")
+    cid = con.execute("""INSERT INTO challengers (pair, tf, spec, kind, status, created_at, note, genes)
+                         VALUES (?, ?, ?, 'strategy', 'shadow', ?, ?, ?)""",
+                      (pair, tf, key, ts_str(now), note or ga.describe(genome), json.dumps(genes, ensure_ascii=False))
+                      ).lastrowid
+    con.commit()
+    return cid
+
+
+def strategy_label(c) -> str:
+    import json
+    from . import ga, ga_jobs
+    try:
+        return "戦略：" + ga.describe(ga_jobs.genome_from_genes(json.loads(c.genes)))
+    except Exception:
+        return f"戦略 {c.spec}"
+
+
+def shadow_strategies(con, pair, tf, ind: pd.DataFrame, p, now: pd.Timestamp) -> int:
+    """シャドーモードの戦略のシグナルを、前回処理した足より後に確定した足の分だけ記録する（初回は最新の確定足だけ。
+    過去にさかのぼって作らない）。エントリーは本番と同じく次の足の始値（fill_entries・resolve_signals が答え合わせをする）。"""
+    import json
+    from . import ga, ga_jobs
+    ch = challengers(con, pair, tf)
+    ch = ch[(ch["kind"] == "strategy") & ch["status"].isin(["shadow", "ready"])] if len(ch) else ch
+    added = 0
+    n = len(ind)
+    atr = ind["atr"].to_numpy()
+    max_bars = TRACKING[tf].log_max_bars
+    for c in ch.itertuples():
+        genome = ga_jobs.genome_from_genes(json.loads(c.genes))
+        sig = ga.make_func(genome)(ind, p).where(ind["atr"].notna(), 0).astype(int).to_numpy()
+        state = f"challenger_{c.id}_last_bar"
+        last = tracking.get_state(con, pair, tf, state)
+        start = n - 1 if last is None else int(ind.index.searchsorted(pd.Timestamp(last), side="right"))
+        rows = [(pair, tf, c.spec, ts_str(ind.index[i]), int(sig[i]), float(atr[i]), max_bars, ts_str(now))
+                for i in range(start, n) if sig[i]]
+        before = con.total_changes
+        con.executemany(
+            """INSERT OR IGNORE INTO signal_log (pair, tf, source, signal_time, direction, atr, max_bars, logged_at,
+               suppressed, shadow, status, entry_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, '待機', 'next_open')""", rows)
+        added += con.total_changes - before
+        tracking.set_state(con, pair, tf, state, ts_str(ind.index[-1]))
+    con.commit()
+    return added
+
+
+@dataclass
+class StrategyComparison:
+    days: float
+    n: int
+    pips: float
+    mean: float
+    p_value: float           # 「1回あたりの損益がプラス」が偶然である確率（ブートストラップ）
+    dd: float
+    base_n: int
+    base_mean: float
+    base_dd: float
+    checks: list[tuple[str, bool, str]]
+
+    @property
+    def ready(self) -> bool:
+        return all(ok for _, ok, _ in self.checks)
+
+
+def compare_strategy(con, cid: int, now: pd.Timestamp, last_swap_at: pd.Timestamp | None = None) -> StrategyComparison:
+    c = con.execute("SELECT pair, tf, spec, created_at FROM challengers WHERE id=?", (cid,)).fetchone()
+    pair, tf, key, created = c
+    days = (now - pd.Timestamp(created)).total_seconds() / 86400
+    done = tuple(tracking.DONE)
+
+    def closed(source, shadow):
+        return pd.read_sql_query(
+            f"""SELECT exit_time, pips FROM signal_log WHERE pair=? AND tf=? AND source=? AND shadow=? AND signal_time >= ?
+                AND status IN ({",".join("?" * len(done))}) AND pips IS NOT NULL ORDER BY exit_time""",
+            con, params=(pair, tf, source, shadow, created, *done))
+
+    me, base = closed(key, 1), closed(STRATEGY_BASELINE, 0)
+    x, y = me["pips"].to_numpy(dtype=float), base["pips"].to_numpy(dtype=float)
+    mean = float(x.mean()) if len(x) else float("nan")
+    bmean = float(y.mean()) if len(y) else float("nan")
+    p = bootstrap_p(x)
+    dd, bdd = _max_dd(x), _max_dd(y)
+    checks = [
+        ("シャドーモードの期間", days >= SHADOW_DAYS, f"{days:.0f}日（{SHADOW_DAYS}日以上）"),
+        ("決済したシグナルの数", len(x) >= MIN_SIGNALS, f"{len(x)}件（{MIN_SIGNALS}件以上）"),
+        ("コスト後の損益がプラスで、偶然ではない", len(x) > 0 and mean > 0 and p < P_VALUE,
+         f"1回あたり {mean:+.1f} pips・p = {p:.2f}（{P_VALUE}未満）" if len(x) else "まだ記録がありません"),
+        ("本番の「移動平均クロス」より良い", len(y) >= MIN_TAKEN and len(x) > 0 and mean > bmean,
+         f"1回あたり {mean:+.1f} ／ 本番 {bmean:+.1f} pips（本番 {len(y)}件。{MIN_TAKEN}件以上）" if len(y) else "本番の記録がまだありません"),
+        ("最大ドローダウン", -dd <= DD_TOLERANCE * -bdd + DD_SLACK_PIPS,
+         f"{dd:,.0f} ／ 本番 {bdd:,.0f} pips（本番の{DD_TOLERANCE}倍＋{DD_SLACK_PIPS:g} pips まで）"),
+    ]
+    if last_swap_at is not None:
+        gap = (now - last_swap_at).days
+        checks.append(("前回の入れ替えから", gap >= SWAP_INTERVAL_DAYS, f"{gap}日（{SWAP_INTERVAL_DAYS}日以上）"))
+    return StrategyComparison(days, len(x), float(x.sum()), mean, p, dd, len(y), bmean, bdd, checks)
+
+
+def review_strategies(con, pair, tf, now: pd.Timestamp) -> list[str]:
+    out = []
+    ch = challengers(con, pair, tf)
+    if ch.empty:
+        return out
+    for c in ch[(ch["kind"] == "strategy") & ch["status"].isin(["shadow", "ready"])].itertuples():
+        cmp = compare_strategy(con, c.id, now, last_swap(con, pair, tf))
+        if update_status(con, pair, tf, c.id, cmp, now):
+            out.append(f"{strategy_label(c)} が、本番への追加の条件を満たしました")
     return out

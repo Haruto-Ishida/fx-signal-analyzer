@@ -20,7 +20,9 @@ def render(ctx: Context) -> None:
         pin = mlops.pinned_version(con, ctx.pair, ctx.tf_key)
         spec = mlops.current_spec(con, ctx.pair, ctx.tf_key)
         ch = mlops.challengers(con, ctx.pair, ctx.tf_key)
-        cmps = {int(c.id): mlops.compare(con, int(c.id), data.now_utc(), last_swap=mlops.last_swap(con, ctx.pair, ctx.tf_key))
+        ls = mlops.last_swap(con, ctx.pair, ctx.tf_key)
+        cmps = {int(c.id): (mlops.compare_strategy(con, int(c.id), data.now_utc(), ls) if c.kind == "strategy"
+                            else mlops.compare(con, int(c.id), data.now_utc(), last_swap=ls))
                 for c in ch[ch["status"].isin(["shadow", "ready"])].itertuples()}
     finally:
         con.close()
@@ -73,7 +75,7 @@ def render(ctx: Context) -> None:
             st.caption("まだありません。")
         for c in ch.itertuples():
             sp = mlops.SPECS.get(c.spec)
-            name = sp.label if sp else c.spec
+            name = ("機械学習：" + sp.label) if sp else mlops.strategy_label(c)
             status = {"shadow": "シャドーモード中", "ready": "🔔 入れ替えの提案中", "approved": "承認して入れ替え済み",
                       "rejected": "見送り"}.get(c.status, c.status)
             st.markdown(f"- **{name}**（{status}・{_jst(c.created_at)} から）")
@@ -81,7 +83,11 @@ def render(ctx: Context) -> None:
             if cmp is not None:
                 st.dataframe(pd.DataFrame([{"条件": n, "結果": "✅" if ok else "—", "内容": d} for n, ok, d in cmp.checks]),
                              hide_index=True, width="stretch")
-                st.caption(f"同じシグナル {cmp.n} 件での損益：本番 {cmp.pips_champ:+,.1f} pips ／ チャレンジャー {cmp.pips_chal:+,.1f} pips")
+                if c.kind == "strategy":
+                    st.caption(f"シャドーモードで決済したシグナル {cmp.n} 件の損益（コスト後）：{cmp.pips:+,.1f} pips。"
+                               "本番には使わず、出ていたはずのシグナルを記録しているだけです。")
+                else:
+                    st.caption(f"同じシグナル {cmp.n} 件での損益：本番 {cmp.pips_champ:+,.1f} pips ／ チャレンジャー {cmp.pips_chal:+,.1f} pips")
             if c.status == "ready":
                 b1, b2 = st.columns(2)
                 if b1.button("✅ 承認して入れ替える", key=f"approve_{c.id}"):

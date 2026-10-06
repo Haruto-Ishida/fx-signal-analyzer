@@ -183,7 +183,7 @@ def pending_signals(con: sqlite3.Connection, since: pd.Timestamp) -> pd.DataFram
         """SELECT s.id, s.pair, s.tf, s.source, s.signal_time, s.direction, s.entry, s.sl, s.tp, s.meta_decision,
                   v.verdict, v.dsr, v.pbo, v.n_trials
            FROM signal_log s LEFT JOIN backtest_verdicts v ON v.pair=s.pair AND v.tf=s.tf AND v.source=s.source
-           WHERE s.logged_at > ? AND s.suppressed = 0 AND s.entry IS NOT NULL AND s.source NOT LIKE 'ml\\_%' ESCAPE '\\'
+           WHERE s.logged_at > ? AND s.suppressed = 0 AND s.shadow = 0 AND s.entry IS NOT NULL AND s.source NOT LIKE 'ml\\_%' ESCAPE '\\'
            ORDER BY s.signal_time""", con, params=(ts_str(since),))
 
 

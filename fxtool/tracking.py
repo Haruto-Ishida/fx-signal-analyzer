@@ -165,6 +165,11 @@ def migrate(con: sqlite3.Connection) -> None:
     for c, typ in (("kind", "TEXT"), ("mode", "TEXT"), ("threshold", "REAL"), ("n_trials", "INTEGER")):
         if c not in reg_cols:
             con.execute(f"ALTER TABLE model_registry ADD COLUMN {c} {typ}")
+    # 2026-10-07：戦略のチャレンジャー（シャドーモード）の記録。本番の表示・口座・通知・重みには使わない
+    if "shadow" not in _columns(con, "signal_log"):
+        con.execute("ALTER TABLE signal_log ADD COLUMN shadow INTEGER NOT NULL DEFAULT 0")
+    if "genes" not in _columns(con, "challengers"):
+        con.execute("ALTER TABLE challengers ADD COLUMN genes TEXT")
     # Step 8：モデルの特徴量の版（NULL ＝ v2）
     if "features" not in _columns(con, "model_registry"):
         con.execute("ALTER TABLE model_registry ADD COLUMN features TEXT")
@@ -445,9 +450,11 @@ def _numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 
-def load_signal_log(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
+def load_signal_log(con: sqlite3.Connection, pair: str, tf: str, include_shadow: bool = False) -> pd.DataFrame:
+    """本番の記録。シャドーモードのチャレンジャー（戦略）の記録（shadow=1）は、include_shadow=True のときだけ含める。"""
     df = pd.read_sql_query(
-        "SELECT * FROM signal_log WHERE pair=? AND tf=? ORDER BY signal_time", con, params=(pair, tf),
+        "SELECT * FROM signal_log WHERE pair=? AND tf=?" + ("" if include_shadow else " AND shadow=0") + " ORDER BY signal_time",
+        con, params=(pair, tf),
         parse_dates=["signal_time", "exit_time", "logged_at"],
     )
     return _numeric(df, ["entry", "sl", "tp", "atr", "prob", "weight", "exit_price", "pips", "meta_p"])

@@ -133,3 +133,34 @@ def test_schedule_gap(tmp_path):
     assert jobs.schedule_gap(con, now) is None                     # 2時間前なら正常
     con.execute("INSERT INTO job_runs (pair, tf, origin, started_at) VALUES ('USD/JPY', '1h', 'dashboard', '2026-10-07 02:59:00')")
     assert jobs.schedule_gap(con, now + pd.Timedelta(hours=2)) == pd.Timedelta(hours=3, minutes=55)  # 画面の処理は数えない
+
+
+def test_strategy_challenger_is_logged_in_shadow_only(world):
+    """戦略のチャレンジャー：出ていたはずのシグナルを shadow=1 で記録・答え合わせするだけで、
+    本番の記録・ペーパー口座・機械学習の判定・通知には使わない。試行数は増えない。"""
+    from fxtool import ga, notify, paper
+    world.cycle()
+    n0 = trials.count(world.con, PAIR, TF)
+    genes = ga.genes_of((0, 0, 0))   # SMA10 が SMA50 を抜ける（テスト用に、シグナルがよく出るもの）
+    cid = mlops.register_strategy(world.con, PAIR, TF, genes, world.now)
+    with pytest.raises(ValueError):
+        mlops.register_strategy(world.con, PAIR, TF, genes, world.now)   # 二重には始めない
+    assert trials.count(world.con, PAIR, TF) == n0
+    for _ in range(6):
+        world.advance(48)
+        world.cycle()
+    key = ga.key_of((0, 0, 0))
+    allrows = tracking.load_signal_log(world.con, PAIR, TF, include_shadow=True)
+    sh = allrows[allrows["source"] == key]
+    assert len(sh) > 0 and (sh["shadow"] == 1).all()
+    created = pd.Timestamp(mlops.challengers(world.con, PAIR, TF)["created_at"].iat[0])
+    assert (sh["signal_time"] >= created - pd.Timedelta(hours=2)).all()     # 過去にさかのぼって作らない
+    assert sh["status"].isin(tracking.DONE).any()                           # 本番と同じく答え合わせされる
+    assert sh["meta_p"].isna().all()                                        # 機械学習の判定には使わない
+    prod = tracking.load_signal_log(world.con, PAIR, TF)
+    assert key not in set(prod["source"])                                   # 本番の記録には出ない
+    assert key not in set(paper.eligible(world.con)["source"])              # ペーパー口座では取引しない
+    assert key not in set(notify.pending_signals(world.con, pd.Timestamp("2000-01-01"))["source"])  # 通知しない
+    cmp = mlops.compare_strategy(world.con, cid, world.now)
+    assert cmp.n == int(sh["status"].isin(tracking.DONE).sum()) and not cmp.ready   # 28日たっていない
+    assert "戦略：" in mlops.strategy_label(mlops.challengers(world.con, PAIR, TF).iloc[0])

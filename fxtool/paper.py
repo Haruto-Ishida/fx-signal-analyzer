@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS paper_log (
 ELIGIBLE_SQL = """
     SELECT id AS signal_id, pair, tf, source, signal_time, direction, entry, sl, tp, status, exit_time, pips, meta_decision
     FROM signal_log
-    WHERE source NOT LIKE 'ml\\_%' ESCAPE '\\' AND suppressed = 0 AND entry_basis = 'next_open'
+    WHERE source NOT LIKE 'ml\\_%' ESCAPE '\\' AND suppressed = 0 AND shadow = 0 AND entry_basis = 'next_open'
       AND (meta_decision IS NULL OR meta_decision != '見送り')
 """
 
