@@ -53,8 +53,14 @@ class CostSettings:
 class TrialBudget:
     ga_full_search: int = 500
     ga_weekly_search: int = 150         # 定期的な再探索 1回あたり（前回の上位候補の周辺だけ）
-    ga_weekly_enabled: bool = True      # 定期的な再探索をするか
+    ga_weekly_enabled: bool = False     # 定期的な再探索をするか（2026-10-07：全通りの評価に切り替えたので止めた）
     ga_interval_weeks: int = 3          # 再探索の間隔（週）。日本時間の土曜に行う
+
+
+@dataclass(frozen=True)
+class Review:
+    interval_months: int = 12   # 見直し（開発用データを新しくして選び直す）の間隔
+    notice_days: int = 30       # 見直しの時期のこの日数前から、画面と Discord で知らせる
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,8 @@ LIMITS = {
     ("trial_budget", "ga_interval_weeks"): (1, 52),
     ("kill_switch", "max_signals_per_day"): (1, 1000),
     ("papers", "max_results"): (1, 200),
+    ("review", "interval_months"): (1, 60),
+    ("review", "notice_days"): (1, 180),
 }
 
 
@@ -91,6 +99,7 @@ class Settings:
     costs: CostSettings = CostSettings()
     trial_budget: TrialBudget = TrialBudget()
     papers: Papers = Papers()
+    review: Review = Review()
     signal_caps: dict = field(default_factory=dict)  # 通貨ペアごとの1日のシグナルの回数の上限（[signal_caps]）
     warnings: tuple[str, ...] = field(default=(), compare=False)
 
@@ -99,7 +108,7 @@ class Settings:
 
 
 _SECTIONS = {"paper": Paper, "sizing": Sizing, "kill_switch": KillSwitch, "event_filter": EventFilter,
-             "costs": CostSettings, "trial_budget": TrialBudget, "papers": Papers}
+             "costs": CostSettings, "trial_budget": TrialBudget, "papers": Papers, "review": Review}
 
 
 def load(path: Path | None = None) -> Settings:

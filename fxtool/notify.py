@@ -117,7 +117,7 @@ def signal_message(pair: str, tf: str, strategy_name: str, direction: int, signa
 
 def status_message(kind: str, text: str) -> str:
     icon = {"kill": "⛔", "release": "✅", "retrain": "🤖", "challenger": "🔔", "papers": "📰", "error": "⚠️",
-            "alert": "🔔"}.get(kind, "ℹ️")
+            "alert": "🔔", "review": "🗓️"}.get(kind, "ℹ️")
     return f"{icon} {text}"
 
 
@@ -216,6 +216,16 @@ def notify_cycle(con: sqlite3.Connection, now: pd.Timestamp, cfg: Config | None 
     if kill is not None:
         for t in kill.trips:
             out(f"kill:{t.key}", "kill", kill_message(t.kind, t.until))
+    # 年1回の見直しの時期（近づいたとき・過ぎたときに、それぞれ1回だけ）
+    from . import review
+    from .config import JOB_PAIRS
+    from .settings import load as load_settings
+    r_cfg = load_settings().review
+    for pair in JOB_PAIRS:
+        for tf in TIMEFRAMES:
+            rs = review.status(pair, tf, now, r_cfg)
+            if rs is not None and rs.state != "ok":
+                out(f"review:{pair}:{tf}:{rs.due:%Y-%m-%d}:{rs.state}", "review", status_message("review", rs.message()))
     tracking.set_state(con, "*", "*", "notify_last", ts_str(now))
     con.commit()
     return counts

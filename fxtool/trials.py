@@ -1,7 +1,9 @@
 """試行の記録。研究ノート 2-3「試した戦略・パラメータの組み合わせの数を必ず記録する」。
 
 - バックテスト・ウォークフォワードの候補・機械学習の評価をするたびに、設定と結果を記録する。
-- 「試した数」は設定の種類（config_hash）の数で数える。同じ設定を何度評価しても1つ。
+- 「試した数」は「設定の種類（config_hash）× 使ったデータの期間」の数（trial_key）で数える。
+  同じ設定を同じ期間で何度評価しても1つ。**データの期間が変わったら（年1回の見直しで開発用データを新しくしたときなど）
+  別の試行として数える**（2026-10-07 のユーザーの決定。新しいデータでもう一度選び直すことも「試すこと」だから）。
   取引コストは戦略の選択ではないのでハッシュに含めないが、損切り・利確・決済ルールは含める。
 - 研究ノートを反映する前の試行は、会話の記録から再構成して origin='retroactive' で登録する。
 """
@@ -41,18 +43,29 @@ def config_hash(family: str, config: dict) -> str:
     return hashlib.sha1(json.dumps([family, config], sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
 
 
+def _ts(x) -> str | None:
+    return None if x is None or (isinstance(x, float) and pd.isna(x)) else pd.Timestamp(x).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def trial_key(chash: str, data_from=None, data_to=None) -> str:
+    """設定 × データの期間。期間がわからない記録（推定の過去分など）は、期間なしとして1つにまとめる。"""
+    period = f"{_ts(data_from) or ''}~{_ts(data_to) or ''}"
+    return hashlib.sha1(f"{chash}|{period}".encode()).hexdigest()[:16]
+
+
 def record(con: sqlite3.Connection, rows: list[dict], *, pair: str, tf: str, origin: str, now: pd.Timestamp,
            data_from=None, data_to=None, n_bars: int | None = None, note: str | None = None) -> int:
     """rows の各要素：family, name, purpose, config, metrics（任意）。"""
-    def ts(x):
-        return None if x is None else pd.Timestamp(x).strftime("%Y-%m-%d %H:%M:%S")
+    def keys(r):
+        h = config_hash(r["family"], r["config"])
+        return h, trial_key(h, data_from, data_to)
 
     con.executemany(
-        """INSERT INTO trials (created_at, pair, tf, family, name, purpose, config, config_hash,
-           data_from, data_to, n_bars, metrics, origin, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        [(ts(now), pair, tf, r["family"], r["name"], r["purpose"],
-          json.dumps(r["config"], sort_keys=True, ensure_ascii=False), config_hash(r["family"], r["config"]),
-          ts(data_from), ts(data_to), n_bars,
+        """INSERT INTO trials (created_at, pair, tf, family, name, purpose, config, config_hash, trial_key,
+           data_from, data_to, n_bars, metrics, origin, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(_ts(now), pair, tf, r["family"], r["name"], r["purpose"],
+          json.dumps(r["config"], sort_keys=True, ensure_ascii=False), *keys(r),
+          _ts(data_from), _ts(data_to), n_bars,
           None if r.get("metrics") is None else json.dumps(r["metrics"], ensure_ascii=False, default=float),
           origin, note) for r in rows],
     )
@@ -62,8 +75,8 @@ def record(con: sqlite3.Connection, rows: list[dict], *, pair: str, tf: str, ori
 
 def count(con: sqlite3.Connection, pair: str | None = None, tf: str | None = None, family: str | None = None,
           origin: str | None = None) -> int:
-    """試した設定の種類の数。"""
-    q, params = "SELECT COUNT(DISTINCT config_hash) FROM trials WHERE 1=1", []
+    """試した数（設定 × データの期間 の種類の数）。"""
+    q, params = "SELECT COUNT(DISTINCT trial_key) FROM trials WHERE 1=1", []
     for col, val in (("pair", pair), ("tf", tf), ("family", family), ("origin", origin)):
         if val is not None:
             q += f" AND {col}=?"
@@ -71,19 +84,31 @@ def count(con: sqlite3.Connection, pair: str | None = None, tf: str | None = Non
     return int(con.execute(q, params).fetchone()[0])
 
 
-def count_with(con: sqlite3.Connection, pair: str, tf: str, planned: list[dict]) -> int:
-    """記録済みの設定に、これから試す予定の設定（planned）を加えた種類の数。
+def count_with(con: sqlite3.Connection, pair: str, tf: str, planned: list[dict], data_from=None, data_to=None) -> int:
+    """記録済みの試行に、これから試す予定の設定（planned。期間は data_from〜data_to）を加えた数。
     同じ処理の中で複数の評価をするとき、すべて同じ「試した数」で割り引くために使う。"""
-    have = {r[0] for r in con.execute("SELECT DISTINCT config_hash FROM trials WHERE pair=? AND tf=?", (pair, tf))}
-    return len(have | {config_hash(r["family"], r["config"]) for r in planned})
+    have = {r[0] for r in con.execute("SELECT DISTINCT trial_key FROM trials WHERE pair=? AND tf=?", (pair, tf))}
+    return len(have | {trial_key(config_hash(r["family"], r["config"]), data_from, data_to) for r in planned})
 
 
 def summary(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
     return pd.read_sql_query(
-        """SELECT family, origin, COUNT(DISTINCT config_hash) AS n_configs, COUNT(*) AS n_runs
+        """SELECT family, origin, COUNT(DISTINCT trial_key) AS n_configs, COUNT(*) AS n_runs
            FROM trials WHERE pair=? AND tf=? GROUP BY family, origin ORDER BY family, origin""",
         con, params=(pair, tf),
     )
+
+
+def migrate(con: sqlite3.Connection) -> None:
+    """trial_key がない記録（2026-10-07 より前）に、設定 × 記録してあるデータの期間 から trial_key を付ける。"""
+    cols = {r[1] for r in con.execute("PRAGMA table_info(trials)")}
+    if "trial_key" not in cols:
+        con.execute("ALTER TABLE trials ADD COLUMN trial_key TEXT")
+    rows = con.execute("SELECT id, config_hash, data_from, data_to FROM trials WHERE trial_key IS NULL").fetchall()
+    if rows:
+        con.executemany("UPDATE trials SET trial_key=? WHERE id=?",
+                        [(trial_key(h, f, t), i) for i, h, f, t in rows])
+        con.commit()
 
 
 def seed_retroactive(con: sqlite3.Connection) -> None:

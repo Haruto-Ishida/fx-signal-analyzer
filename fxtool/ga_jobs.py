@@ -28,16 +28,21 @@ def run(con: sqlite3.Connection, pair: str, tf: str, kind: str = "full", seed: i
         budget: int | None = None, origin: str = "dashboard", now: pd.Timestamp | None = None) -> int:
     """探索して保存し、ga_runs の id を返す。budget は設定ファイルの上限を超えられない。"""
     s = user_settings.load()
-    cap = s.trial_budget.ga_full_search if kind == "full" else s.trial_budget.ga_weekly_search
-    budget = cap if budget is None else min(int(budget), cap)
-    seed = random.SystemRandom().randrange(2**31) if seed is None else int(seed)
+    if kind == "exhaustive":
+        budget, seed = search_space_size(), 0   # 全通り（乱数は使わない）
+    else:
+        cap = s.trial_budget.ga_full_search if kind == "full" else s.trial_budget.ga_weekly_search
+        budget = cap if budget is None else min(int(budget), cap)
+        seed = random.SystemRandom().randrange(2**31) if seed is None else int(seed)
     now = data.now_utc() if now is None else now
     dev = data.load_dev(con, pair, tf)[["open", "high", "low", "close"]]
     b = data.boundary(con, pair, tf)
     costs, pip = jobs.default_costs(pair), jobs.pip_size(jobs.PAIRS[pair])
     mult = costmodel.spread_multipliers(dev.index, tf, s.costs, s.event_filter)
     rules = jobs.exit_rules(tf)
-    if kind == "full":
+    if kind == "exhaustive":
+        res = ga.exhaustive_search(dev, jobs.RISK, rules, costs, pip, holdout_start=b.start, mult=mult, base_p=jobs.P)
+    elif kind == "full":
         res = ga.search(dev, jobs.RISK, rules, costs, pip, budget, seed, holdout_start=b.start, mult=mult, base_p=jobs.P)
     elif kind == "neighborhood":
         prev = previous_top(con, pair, tf, WEEKLY_TOP)
@@ -87,7 +92,7 @@ def validate(con: sqlite3.Connection, pair: str, tf: str, run_id: int, top_n: in
     mult = costmodel.spread_multipliers(dev.index, tf, s.costs, s.event_filter)
     rules = jobs.exit_rules(tf)
     planned = bt.planned_trials(jobs.P, jobs.RISK, rules, sts)
-    n_trials = trials.count_with(con, pair, tf, planned)
+    n_trials = trials.count_with(con, pair, tf, planned, dev.index[0], dev.index[-1])
     rep = bt.evaluate_all(dev, jobs.P, jobs.RISK, rules, costs, pip, runs=runs, holdout_start=b.start,
                           rw_paths=rw_paths, n_trials=n_trials, strategy_list=sts, spread_mult=mult)
     trials.record(con, rep.trials, pair=pair, tf=tf, origin=origin, now=now, data_from=dev.index[0],
@@ -142,8 +147,18 @@ def evaluated_genomes(con, pair, tf) -> set[tuple[int, int, int]]:
 
 
 def search_space_size() -> int:
-    return len({ga.canonical([t, a, b]) for t in range(len(ga.TRIGGERS))
-                for a in range(len(ga.FILTERS)) for b in range(len(ga.FILTERS))})
+    return len(ga.all_genomes())
+
+
+def review_projection(n_now: int, years: int, done_now: bool, per_review_other: int = 40) -> dict:
+    """「全通りの評価 ＋ 年1回の見直し（開発用データを新しくして全通りを評価し直す）」のときの、years 年後の累計試行数と
+    合格の基準の厳しさ。データの期間が変わると別の試行として数えるので、見直しのたびに全通り分（＋最初からある戦略の候補・
+    機械学習の約 per_review_other 通り）増える。done_now は、いまの開発用データで全通りの評価をすでにしたか。"""
+    from . import overfit
+    space = search_space_size()
+    n = n_now + (0 if done_now else space) + years * (space + per_review_other)
+    base = overfit.expected_max_sharpe(max(n_now, 2), 1.0)
+    return {"years": years, "trials": n, "strict": overfit.expected_max_sharpe(n, 1.0) / base}
 
 
 @dataclass

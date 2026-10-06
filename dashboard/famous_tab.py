@@ -29,7 +29,7 @@ def evaluate_and_save(pair: str) -> int:
         mult = costmodel.spread_multipliers(dev.index, TF, s.costs, s.event_filter)
         rules = jobs.exit_rules(TF)
         planned = bt.planned_trials(jobs.P, jobs.RISK, rules, famous.FAMOUS)
-        n_trials = trials.count_with(con, pair, TF, planned)
+        n_trials = trials.count_with(con, pair, TF, planned, dev.index[0], dev.index[-1])
         rep = bt.evaluate_all(dev[["open", "high", "low", "close"]], jobs.P, jobs.RISK, rules, costs, pip, runs=200,
                               holdout_start=holdout_start, rw_paths=20, n_trials=n_trials, strategy_list=famous.FAMOUS,
                               spread_mult=mult)

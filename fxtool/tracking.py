@@ -173,6 +173,9 @@ def migrate(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE signal_log ADD COLUMN suppress_reason TEXT")
     con.executescript("""CREATE TABLE IF NOT EXISTS kill_switch_releases (
         key TEXT PRIMARY KEY, released_at TEXT NOT NULL, note TEXT);""")
+    # 2026-10-07：試行の数え方を「設定 × データの期間」に
+    from .trials import migrate as migrate_trials
+    migrate_trials(con)
     # 2026-10-07：GA の評価した順の適応度（何通り目で最良が見つかったかのグラフ用）
     if "trace" not in _columns(con, "ga_runs"):
         con.execute("ALTER TABLE ga_runs ADD COLUMN trace TEXT")

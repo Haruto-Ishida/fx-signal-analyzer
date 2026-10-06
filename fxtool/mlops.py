@@ -135,8 +135,12 @@ def register(con, pair, tf, spec_name: str, now: pd.Timestamp, note: str = "") -
     cid = con.execute("""INSERT INTO challengers (pair, tf, spec, kind, status, created_at, note)
                          VALUES (?, ?, ?, ?, 'shadow', ?, ?)""", (pair, tf, spec_name, kind, ts_str(now), note)).lastrowid
     plan = ml_eval.planned_trials("meta", ML_META_THRESHOLD, VERTICAL_BARRIER[tf], ML_META_FOLDS, spec.features, (kind,))
+    # 期間は、入れ替えの前に検証する開発用データの期間（dev_check と同じ試行として数える）
+    from . import data
+    dev = data.load_dev(con, pair, tf)
     trials.record(con, [{**r, "purpose": "challenger_shadow"} for r in plan], pair=pair, tf=tf, origin="dashboard",
-                  now=now, note=f"チャレンジャー {cid}（{spec.label}）をシャドーモードで開始")
+                  now=now, data_from=dev.index[0], data_to=dev.index[-1], n_bars=len(dev),
+                  note=f"チャレンジャー {cid}（{spec.label}）をシャドーモードで開始")
     con.commit()
     return cid
 

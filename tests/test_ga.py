@@ -174,8 +174,10 @@ def test_budget_is_capped_by_settings(tmp_db, monkeypatch):
 def test_re_search_runs_every_3_weeks_on_saturday(tmp_db, tmp_path):
     from fxtool import ga_jobs, settings
     sat = pd.Timestamp("2026-10-10 03:00")  # 日本時間の土曜 12:00
-    on = settings.load()
-    assert on.trial_budget.ga_weekly_enabled is True and on.trial_budget.ga_interval_weeks == 3
+    p0 = tmp_path / "on.toml"
+    p0.write_text("[trial_budget]\nga_weekly_enabled = true\n", encoding="utf-8")
+    on = settings.load(p0)        # 仕組みは残しているので、有効にすれば3週間に1回・土曜に動く
+    assert on.trial_budget.ga_interval_weeks == 3 and settings.load().trial_budget.ga_weekly_enabled is False
     assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", sat, on)   # 本格的な探索の結果がまだない
     tmp_db.execute("""INSERT INTO ga_runs (pair, tf, kind, seed, budget, n_evaluated, started_at, origin)
                       VALUES ('EUR/JPY', '1d', 'full', 1, 500, 500, '2026-09-19 03:00:00', 'dashboard')""")
@@ -195,9 +197,11 @@ def test_re_search_runs_every_3_weeks_on_saturday(tmp_db, tmp_path):
     assert ga_jobs.projected_trials_per_year(off) == 500
 
 
-def test_projection_is_capped_by_the_search_space():
+def test_projection_is_capped_by_the_search_space(tmp_path):
     from fxtool import ga_jobs, settings
-    s = settings.load()
+    p = tmp_path / "on.toml"
+    p.write_text("[trial_budget]\nga_weekly_enabled = true\n", encoding="utf-8")
+    s = settings.load(p)
     p1 = ga_jobs.projection(86, s, 1)
     p4 = ga_jobs.projection(86, s, 4)
     assert p1["re_search_runs"] == 18 and p4["re_search_runs"] == 70
@@ -243,5 +247,37 @@ def test_settings_reject_non_boolean_and_over_budget(tmp_path):
     p = tmp_path / "s.toml"
     p.write_text('[trial_budget]\nga_weekly_enabled = "false"\nga_full_search = 5000\n', encoding="utf-8")
     s = settings.load(p)
-    assert s.trial_budget.ga_weekly_enabled is True and s.trial_budget.ga_full_search == 500
+    assert s.trial_budget.ga_weekly_enabled is False and s.trial_budget.ga_full_search == 500
     assert len(s.warnings) == 2
+
+
+def test_exhaustive_evaluates_every_combination_once(tmp_db):
+    from fxtool import ga_jobs
+    assert len(ga.all_genomes()) == ga_jobs.search_space_size() == 1064
+    n0 = trials.count(tmp_db, "EUR/JPY", "1d")
+    run_id = ga_jobs.run(tmp_db, "EUR/JPY", "1d", "exhaustive")
+    r = tmp_db.execute("SELECT kind, n_evaluated, seed, trace FROM ga_runs WHERE id=?", (run_id,)).fetchone()
+    assert r[:3] == ("exhaustive", 1064, 0) and len(json.loads(r[3])) == 1064
+    assert trials.count(tmp_db, "EUR/JPY", "1d") == n0 + 1064
+    assert ga_jobs.evaluated_genomes(tmp_db, "EUR/JPY", "1d") == set(ga.all_genomes())
+    c = ga_jobs.load_candidates(tmp_db, run_id)
+    assert c["fitness"].is_monotonic_decreasing and len(c) == 20
+    # もう一度やっても同じ結果（乱数を使わない）・試行数は増えない（同じ設定・同じ期間）
+    run2 = ga_jobs.run(tmp_db, "EUR/JPY", "1d", "exhaustive")
+    assert list(ga_jobs.load_candidates(tmp_db, run2)["key"]) == list(c["key"])
+    assert trials.count(tmp_db, "EUR/JPY", "1d") == n0 + 1064
+
+
+def test_exhaustive_refuses_final_test_data(daily):
+    with pytest.raises(FinalTestAccessError):
+        ga.exhaustive_search(daily, RiskParams(), RULES, COSTS, 0.01, holdout_start=daily.index[1000])
+
+
+def test_review_projection():
+    from fxtool import ga_jobs
+    p0 = ga_jobs.review_projection(89, 0, False)
+    p1 = ga_jobs.review_projection(89, 1, False)
+    p4 = ga_jobs.review_projection(89, 4, True)
+    assert p0["trials"] == 89 + 1064 and p1["trials"] == 89 + 1064 + 1104
+    assert p4["trials"] == 89 + 4 * 1104
+    assert 1 < p0["strict"] < p1["strict"] < p4["strict"]

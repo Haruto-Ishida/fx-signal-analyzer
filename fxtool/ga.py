@@ -359,6 +359,29 @@ def search(dev: pd.DataFrame, risk: RiskParams, rules: bt.ExitRules, costs: bt.C
     return _result(ev, seed, budget, "full", base_p)
 
 
+def all_genomes() -> list[tuple[int, int, int]]:
+    """部品の組み合わせすべて（同じ意味の組み合わせは1つ）。"""
+    return sorted({canonical([t, a, b]) for t in range(len(TRIGGERS))
+                   for a in range(len(FILTERS)) for b in range(len(FILTERS))})
+
+
+def exhaustive_search(dev: pd.DataFrame, risk: RiskParams, rules: bt.ExitRules, costs: bt.Costs, pip: float,
+                      holdout_start: pd.Timestamp | None = None, mult=None,
+                      base_p: IndicatorParams = IndicatorParams()) -> SearchResult:
+    """全通りの評価（2026-10-07 のユーザーの決定で、GA の探索の代わりに使う）。
+    組み合わせが 1,064 通りしかなく、開発用データも固定なので、GA で一部だけを探すより、全部を一度だけ調べる方が
+    見逃しがなく、乱数にも左右されない。GA の探索（search）は、将来部品を増やして全部は調べられなくなったときのために残す。"""
+    if holdout_start is not None and len(dev) and dev.index[-1] >= holdout_start:
+        from .holdout import FinalTestAccessError
+        raise FinalTestAccessError("最終テスト期間のデータが全通りの評価に渡されています")
+    genomes = all_genomes()
+    ind = indicators.add_all(dev, base_p)
+    ev = _Evaluator(ind, risk, rules, costs, pip, len(genomes), mult)
+    for g in genomes:
+        ev(g)
+    return _result(ev, 0, len(genomes), "exhaustive", base_p)
+
+
 def neighbors(genome) -> list[tuple[int, int, int]]:
     """1つの遺伝子だけを変えた組み合わせ（周辺）。"""
     out = set()

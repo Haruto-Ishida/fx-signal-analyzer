@@ -176,7 +176,7 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
     spec = mlops.current_spec(con, pair, tf_key)
     planned = (bt.planned_trials(P, RISK, exit_rules(tf_key))
                + ml_eval.planned_trials("meta", ML_META_THRESHOLD, VERTICAL_BARRIER[tf_key], ML_META_FOLDS, spec.features))
-    n_trials = trials.count_with(con, pair, tf_key, planned)
+    n_trials = trials.count_with(con, pair, tf_key, planned, ind_dev.index[0], ind_dev.index[-1])
 
     # 機械学習（メタラベリング）：再学習の前に、それまでのモデルで新しいシグナルを判定する。
     # 前のバージョンに戻して固定しているときは、そのモデルを使い、自動の再学習はしない

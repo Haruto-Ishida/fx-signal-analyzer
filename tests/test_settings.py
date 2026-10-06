@@ -8,7 +8,9 @@ def test_project_settings_file_loads_without_warnings():
     assert s.kill_switch.max_consecutive_losses == 5 and s.kill_switch.max_signals_per_day == 10
     assert s.kill_switch.daily_loss_pct == 3.0 and s.kill_switch.weekly_loss_pct == 6.0
     assert s.trial_budget.ga_full_search == 500 and s.trial_budget.ga_weekly_search == 150
-    assert s.trial_budget.ga_weekly_enabled is True and s.trial_budget.ga_interval_weeks == 3
+    # 2026-10-07：GA の探索をやめて全通りの評価に切り替えたので、定期的な再探索は止めている
+    assert s.trial_budget.ga_weekly_enabled is False and s.trial_budget.ga_interval_weeks == 3
+    assert s.review.interval_months == 12 and s.review.notice_days == 30
     # 2026-10-07 に計算した、通貨ペアごとの1日のシグナルの回数の上限
     assert s.signal_caps == {"USD/JPY": 13, "EUR/JPY": 13, "GBP/JPY": 13, "AUD/JPY": 13,
                              "EUR/USD": 14, "GBP/USD": 14, "AUD/USD": 14}

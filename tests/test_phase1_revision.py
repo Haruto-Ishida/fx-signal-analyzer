@@ -87,6 +87,27 @@ def test_trial_count_is_by_distinct_config(tmp_path):
     assert trials.count(con, "EUR/JPY", "1h") == 2  # 損切りの幅を変えたら別の試行
 
 
+def test_trial_count_separates_data_periods(tmp_path):
+    """2026-10-07：データの期間が変わったら、同じ設定でも別の試行として数える（年1回の見直しのため）。"""
+    con = data.connect(tmp_path / "t3.db")
+    cfg = trials.strategy_config("ma_cross", P, RISK, bt.ExitRules(max_bars=48))
+    row = {"family": "strategy", "name": "ma_cross", "purpose": "full_period", "config": cfg}
+    a, b, c = pd.Timestamp("2020-01-01"), pd.Timestamp("2025-01-01"), pd.Timestamp("2026-01-01")
+    trials.record(con, [row], pair="EUR/JPY", tf="1h", origin="job", now=NOW, data_from=a, data_to=b)
+    trials.record(con, [row], pair="EUR/JPY", tf="1h", origin="dashboard", now=NOW, data_from=a, data_to=b)
+    assert trials.count(con, "EUR/JPY", "1h") == 1                      # 同じ設定・同じ期間 → 1つ
+    trials.record(con, [row], pair="EUR/JPY", tf="1h", origin="job", now=NOW, data_from=a, data_to=c)
+    assert trials.count(con, "EUR/JPY", "1h") == 2                      # 期間が変わった → 別の試行
+    # これから試す予定の数え方も同じ
+    assert trials.count_with(con, "EUR/JPY", "1h", [row], a, b) == 2
+    assert trials.count_with(con, "EUR/JPY", "1h", [row], a, pd.Timestamp("2027-01-01")) == 3
+    # 以前の記録（trial_key がない）は、つないだときに付け直す
+    con.execute("UPDATE trials SET trial_key=NULL")
+    con.commit()
+    trials.migrate(con)
+    assert trials.count(con, "EUR/JPY", "1h") == 2
+
+
 def test_evaluate_all_reports_every_candidate(random_walk):
     rep = bt.evaluate_all(random_walk, P, RISK, bt.ExitRules(max_bars=48), bt.Costs(), 0.01, runs=5, k=3)
     by_purpose = pd.Series([r["purpose"] for r in rep.trials]).value_counts()

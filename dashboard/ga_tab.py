@@ -1,4 +1,5 @@
-"""タブ「GA探索」（要件定義書 6章）。遺伝的アルゴリズムで見つけた戦略の候補（シグナルには使わない）。"""
+"""タブ「組み合わせ探索」（要件定義書 6章）。戦略の部品の組み合わせを全通り調べた候補（シグナルには使わない）。
+2026-10-07 に GA の探索から全通りの評価に切り替えた。GA の探索の結果があれば、そのグラフも表示する。"""
 from __future__ import annotations
 
 import json
@@ -7,9 +8,23 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from fxtool import data, ga, ga_jobs, trials
+from fxtool import data, ga_jobs, trials
 
 from .common import Context, fmt_pips
+
+
+def render_distribution(trace: list[float]) -> None:
+    """全通りの適応度の分布（ほとんどがどのあたりにあるか・プラスはいくつあるか）。"""
+    x = [v for v in trace if v > -10]   # −10 は取引が少なすぎて評価しなかった組み合わせ
+    n_skip = len(trace) - len(x)
+    fig = go.Figure(go.Histogram(x=[max(v, -3.0) for v in x], nbinsx=60, marker_color="#9e9e9e"))
+    fig.add_vline(x=0, line_dash="dash", line_color="#e53935", annotation_text="0（プラスとマイナスの境目）")
+    fig.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="適応度（−3 未満は −3 にまとめて表示）",
+                      yaxis_title="組み合わせの数")
+    st.plotly_chart(fig, width="stretch")
+    pos = sum(v > 0 for v in x)
+    st.caption(f"評価した {len(x):,} 通りのうち、適応度がプラスは {pos:,} 通り（{pos / max(len(x), 1):.0%}）。"
+               f"取引が少なすぎて評価しなかった組み合わせ：{n_skip:,} 通り。")
 
 
 def render_convergence(trace: list[float], cap: int) -> None:
@@ -40,15 +55,16 @@ def render_convergence(trace: list[float], cap: int) -> None:
 
 def render(ctx: Context) -> None:
     s = ctx.settings
-    tb = s.trial_budget
+    space = ga_jobs.search_space_size()
     st.markdown(
-        "**遺伝的アルゴリズム（GA）**は、戦略の部品（売買のきっかけ1つ＋絞り込みの条件 最大2つ）の組み合わせを、"
-        "生き物の進化のように「良いものどうしを組み合わせる」「一部を変える」をくり返して探す方法です。"
-        f"部品の組み合わせは全部で **{len(set(ga.canonical([t, a, b]) for t in range(len(ga.TRIGGERS)) for a in range(len(ga.FILTERS)) for b in range(len(ga.FILTERS)))):,} 通り**あり、"
-        f"1回の探索で調べるのは **{tb.ga_full_search} 通りまで**です。"
+        "戦略の部品（売買のきっかけ1つ＋絞り込みの条件 最大2つ）の組み合わせを、**全部で "
+        f"{space:,} 通り、1つ残らず**開発用データで調べます。"
+        "以前は遺伝的アルゴリズム（GA：良いものどうしを組み合わせて探す方法）で一部だけを探していましたが、"
+        "組み合わせが少なく全部調べられるので、見逃しがなく、運（乱数）にも左右されない「全通り」に切り替えました。"
+        "GA の仕組みは、将来部品を増やして全部は調べられなくなったときのために残しています。"
     )
     st.warning(
-        "⚠️ GA で見つかった戦略は「たくさん試した中で一番良かったもの」なので、**偶然よく見えているだけの可能性が高い**です。"
+        f"⚠️ ここで一番良かった戦略は「{space:,} 通り試した中で一番良かったもの」なので、**偶然よく見えているだけの可能性が高い**です。"
         "ここに出る候補はシグナルには使いません。ウォークフォワード・PBO・DSR・ランダムとの比較・年別の確認に合格し、"
         "さらにあなたが承認したものだけを採用の候補にします。"
     )
@@ -59,49 +75,43 @@ def render(ctx: Context) -> None:
         cands = ga_jobs.load_candidates(con, int(runs["id"].iloc[0])) if len(runs) else pd.DataFrame()
     finally:
         con.close()
+    done = bool(len(runs) and (runs["kind"] == "exhaustive").any())
 
-    st.caption(
-        f"🧮 試した組み合わせ（{ctx.pair}・{ctx.tf.label}の累計）：{n_now:,} 通り。"
-        f"本格的な探索を1回すると最大 {tb.ga_full_search} 通り増えます。"
-        f"定期的な再探索は **{'有効' if tb.ga_weekly_enabled else '停止中'}**"
-        f"（{tb.ga_interval_weeks}週間に1回・日本時間の土曜・1回 {tb.ga_weekly_search} 通りまで。"
-        "これまでの上位候補の周辺のうち、まだ試していない組み合わせだけを調べます）。"
-    )
-    with st.expander("📈 累計の試行数の見込みと、合格の基準の厳しさ"):
-        has_full = len(runs) and (runs["kind"] == "full").any()
-        rows = []
-        for y in (1, 4):
-            p = ga_jobs.projection(n_now, s, y, full_runs=0 if has_full else 1)
-            rows.append({"期間": f"{y}年後", "再探索の回数": p["re_search_runs"],
-                         "単純な見込み（通り）": f"{p['naive']:,}", "基準の厳しさ（単純）": f"{p['strict_naive']:.2f}倍",
-                         "実際の上限（通り）": f"{p['capped']:,}", "基準の厳しさ（上限）": f"{p['strict_capped']:.2f}倍"})
+    st.caption(f"🧮 試した組み合わせ（{ctx.pair}・{ctx.tf.label}の累計）：{n_now:,} 通り。"
+               + ("全通りの評価は済んでいます（開発用データが変わるまで、やり直しても同じ結果です）。" if done
+                  else f"全通りを調べると {space:,} 通り増えます。"))
+    with st.expander("📈 累計の試行数の見込みと、合格の基準の厳しさ（全通りの評価＋年1回の見直し）"):
+        rows = [{"時期": "全通りを調べた直後" if y == 0 else f"{y}年後（見直し{y}回）", "累計（通り）": f"{p['trials']:,}",
+                 "基準の厳しさ": f"{p['strict']:.2f}倍"}
+                for y in (0, 1, 4) for p in [ga_jobs.review_projection(n_now, y, done)]]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption(
-            f"「単純な見込み」は、毎回上限まで新しい組み合わせを試した場合。ただし GA の組み合わせは全部で "
-            f"{ga_jobs.search_space_size():,} 通りしかなく、同じ組み合わせは二度数えないので、「実際の上限」を超えることはありません。"
-            f"「基準の厳しさ」は、偶然でも出てしまうシャープレシオの水準（DSR の基準）が、いま（{n_now:,} 通り）の何倍になるかです。"
+            "年1回の見直しで開発用データを新しくすると、同じ組み合わせでも「新しいデータでの試行」として数えるので、"
+            f"見直しのたびに約 {space + 40:,} 通り増えます。「基準の厳しさ」は、偶然でも出てしまうシャープレシオの水準"
+            f"（DSR の基準）が、いま（{n_now:,} 通り）の何倍になるかです。"
         )
-    if st.button(f"🧬 開発用データで GA 探索をする（{ctx.pair}・{ctx.tf.label}・最大 {tb.ga_full_search} 通り）",
-                 key="ga_run"):
+    if not done and st.button(f"🔎 開発用データで全通りを調べる（{ctx.pair}・{ctx.tf.label}・{space:,} 通り）", key="exh_run"):
         con = data.connect()
         try:
-            with st.spinner("探索しています…（数十秒〜数分）"):
-                ga_jobs.run(con, ctx.pair, ctx.tf_key, "full")
+            with st.spinner("調べています…（数十秒〜数分）"):
+                ga_jobs.run(con, ctx.pair, ctx.tf_key, "exhaustive")
         finally:
             con.close()
         st.rerun()
 
     if runs.empty:
-        st.info("まだ探索していません。")
+        st.info("まだ調べていません。")
         return
     r = runs.iloc[0]
-    st.markdown(f"### 前回の探索の上位候補（{r['started_at']} UTC・{'本格的な探索' if r['kind'] == 'full' else '周辺の再探索'}・"
-                f"{int(r['n_evaluated'])} 通り・シード値 {int(r['seed'])}）")
+    kind_label = {"exhaustive": "全通りの評価", "full": "GA の探索", "neighborhood": "周辺の再探索"}.get(r["kind"], r["kind"])
+    st.markdown(f"### 上位20個（{r['started_at']} UTC・{kind_label}・{int(r['n_evaluated']):,} 通り）")
     st.caption("適応度：開発用データを時間順に5つに分け、区間ごとのシャープレシオ（年率）の平均から、ばらつきと条件の数を差し引いたもの。"
-               "どの時期でも安定して良いものほど高くなります。")
+               "どの時期でも安定して良いものほど高くなります（0 より大きければ、平均してプラス）。")
+    if r["kind"] == "exhaustive" and isinstance(r["trace"], str):
+        render_distribution(json.loads(r["trace"]))
     full = runs[runs["kind"] == "full"]
-    if len(full) and isinstance(full["trace"].iloc[-1], str):
-        render_convergence(json.loads(full["trace"].iloc[-1]), tb.ga_weekly_search)
+    if r["kind"] != "exhaustive" and len(full) and isinstance(full["trace"].iloc[-1], str):
+        render_convergence(json.loads(full["trace"].iloc[-1]), s.trial_budget.ga_weekly_search)
     st.dataframe(pd.DataFrame({
         "順位": cands["rank"], "ルール": cands["rule"], "適応度": cands["fitness"].round(2),
         "取引回数": cands["trades"], "損益(pips・コスト後)": cands["total_pips"].map(fmt_pips),

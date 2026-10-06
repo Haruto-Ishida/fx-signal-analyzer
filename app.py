@@ -85,6 +85,15 @@ halt = tracking.Halt(bool(stop), " ／ ".join(stop), 0.0, 0.0)
 
 for w in user_cfg.warnings:
     st.warning(f"⚙️ 設定ファイル：{w}")
+from fxtool import review as review_mod  # noqa: E402
+_rs = review_mod.status(pair, tf_key, data.now_utc(), user_cfg.review)
+if _rs is not None and _rs.state != "ok":
+    st.warning(
+        f"🗓️ **{_rs.message()}**  \n"
+        "見直しの手順：① いまの戦略を最終テスト期間で1回だけ確かめる → ② 検証に使う期間を新しくする → "
+        "③ 全通りの評価などをやり直す（試行数は増えます） → ④ 良い候補はチャレンジャーとして試運転し、承認してから使う。"
+        "やるときは Claude に「見直しをしたい」と伝えてください。"
+    )
 if sched_gap is not None:
     st.warning(
         f"⏰ **自動更新（毎時）が {sched_gap.total_seconds() / 3600:.0f} 時間動いていません。**"
@@ -125,7 +134,9 @@ with st.sidebar:
         + ("" if cyc.skipped else f"  \n今回の処理：{cyc.summary()}")
     )
     if boundary is not None:
-        st.caption(f"🔒 **最終テスト期間**：{ctx.label(boundary.start)} 以降（検証には使いません）")
+        st.caption(f"🔒 **最終テスト期間**：{ctx.label(boundary.start)} 以降（検証には使いません）"
+                   + (f"  \n🗓️ **次の見直しの時期**：{(_rs.due + JST):%Y/%m/%d}（年1回・あなたが決めたときだけ行う）"
+                      if _rs is not None else ""))
     st.caption(
         f"🧮 **試した組み合わせ（累計）**：{n_trials_total:,} 通り",
         help="これまでに検証した戦略・パラメータ・モデルの設定の数です。たくさん試すほど、偶然よく見えるものが"
@@ -164,7 +175,7 @@ m2.metric(f"ATR（{P.atr_period}）", f"{last_c['atr'] / ctx.pip:.1f} pips",
 m3.metric("最新の確定足", ctx.label(ind.index[n_conf - 1]))
 
 tab_signals, tab_backtest, tab_ml, tab_tracking, tab_paper, tab_famous, tab_ga, tab_papers, tab_guide = st.tabs(
-    ["📡 現在のシグナル", "🧪 バックテスト", "🤖 機械学習予測", "📒 記録と成績", "💰 ペーパー口座", "📚 有名手法", "🧬 GA探索",
+    ["📡 現在のシグナル", "🧪 バックテスト", "🤖 機械学習予測", "📒 記録と成績", "💰 ペーパー口座", "📚 有名手法", "🧬 組み合わせ探索",
      "📰 論文ウォッチ", "📖 使い方・用語集"]
 )
 with tab_signals:
