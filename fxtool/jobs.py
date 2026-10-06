@@ -21,12 +21,12 @@ import numpy as np
 import pandas as pd
 
 from . import backtest as bt
-from . import (costmodel, data, events, holdout, indicators, killswitch, ml, ml_eval, mlops, strategies, tracking,
-               trials)
+from . import (costmodel, data, events, holdout, indicators, killswitch, ml, ml_eval, mlops, paper, strategies,
+               tracking, trials)
 from . import settings as user_settings
 from .config import (
-    DAILY_MAX_LOSS_R, DEFAULT_SLIPPAGE, DEFAULT_SPREAD, LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, ML_META_FOLDS,
-    ML_META_THRESHOLD, MODELS_DIR, PAIRS, ROOT, TIMEFRAMES, TRACKING, VERTICAL_BARRIER, WEEKLY_MAX_LOSS_R,
+    DEFAULT_SLIPPAGE, DEFAULT_SPREAD, LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, ML_META_FOLDS,
+    ML_META_THRESHOLD, MODELS_DIR, PAIRS, ROOT, TIMEFRAMES, TRACKING, VERTICAL_BARRIER,
     IndicatorParams, RiskParams, pip_size,
 )
 from .tracking import ts_str
@@ -72,7 +72,7 @@ class CycleResult:
         if self.verdicts_updated:
             parts.append("戦略の検証結果を更新")
         if self.halted:
-            parts.append("最大損失・キルスイッチのため新しいシグナルを停止中")
+            parts.append("キルスイッチのため新しいシグナルを停止中")
         if self.new_alerts:
             parts.append(f"新しい警告{self.new_alerts}件")
         if self.data_error:
@@ -143,11 +143,11 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
     ind = indicators.add_all(conf, P)
     ind_dev = holdout.dev_part(ind, b)  # 選ぶ判断（検証・条件の判定）にはこれだけを使う
 
-    # 先に答え合わせをして、最新の決済まで反映した記録で重みと最大損失を判断する
+    # 先に答え合わせをして、最新の決済まで反映した記録で重みとキルスイッチを判断する
     fill_entries(con, pair, tf_key, raw)
     res.outcomes_closed = resolve_signals(con, pair, tf_key, ind, costs, pip)
 
-    # 本番の記録にもとづく重みと、最大損失による停止
+    # 本番の記録にもとづく重み
     closed = closed_signals(con, pair, tf_key)
     closed_strat = closed[~closed["source"].str.startswith("ml_")]
     live = tracking.live_performance(closed_strat, LIVE_WEIGHT_WINDOW, LIVE_WEIGHT_MIN_TRADES)
@@ -158,19 +158,18 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
         [(pair, tf_key, ts_str(ind.index[-1]), r.source, r.weight, r.n, r.total,
           r.pf if math.isfinite(r.pf) else None, r.z) for r in live],
     )
-    halt = tracking.loss_halt(closed, now, RISK.sl_atr, pip, DAILY_MAX_LOSS_R, WEEKLY_MAX_LOSS_R)
-    # キルスイッチ（ペーパー口座全体の記録から。要件定義書 8章）
+    # キルスイッチ（ペーパー口座全体の記録から。要件定義書 8章。2026-10-07 から % の基準だけ）
     s = user_settings.load()
-    _, kill = killswitch.check(con, now, s, data.latest_close(con, "USD/JPY"))
-    # 1日の回数は、シグナルごとにその日の回数で判断する（まとめて記録するときに、別の日の分まで止めないように）
-    stop_reasons = [x for x in (halt.reason if halt.active else "",
-                                " ／ ".join(t.reason for t in kill.trips if t.kind != "frequency")) if x]
-    res.halted = " ／ ".join([*stop_reasons, *(t.reason for t in kill.trips if t.kind == "frequency")])
+    acc, kill = killswitch.check(con, now, s, data.latest_close(con, "USD/JPY"))
+    paper.save_log(con, acc, now)
+    # 1日の回数は、シグナルごとにその日・その通貨ペアの回数で判断する（まとめて記録するときに、別の日の分まで止めないように）
+    mine = kill.trips_for(pair)
+    stop_reasons = [t.reason for t in mine if t.kind != "frequency"]
+    res.halted = " ／ ".join(t.reason for t in mine)
 
     res.signals_logged = log_strategy_signals(con, pair, tf_key, ind, {r.source: r.weight for r in live}, now,
                                               suppressed=bool(stop_reasons), reason=" ／ ".join(stop_reasons),
-                                              max_per_day=s.kill_switch.max_signals_per_day,
-                                              event_filter=s.event_filter)
+                                              max_per_day=s.signal_cap(pair), event_filter=s.event_filter)
     fill_entries(con, pair, tf_key, raw)
 
     # この処理で試す予定の設定も含めた「試した数」。戦略の判定と機械学習の条件を、同じ数で割り引く
@@ -211,9 +210,7 @@ def _cycle(con, pair, tf_key, now, force, retrain, res: CycleResult) -> None:
     conds += tracking.meta_conditions(registry[registry["model"] == "meta"].reset_index(drop=True),
                                       tracking.load_signal_log(con, pair, tf_key))
     conds += tracking.data_condition(ind.index[-1], now, tf.bar, settings.stale_bars)
-    if halt.active:
-        conds.append(tracking.Condition("risk", "max_loss", "critical", halt.reason))
-    for t in kill.trips:
+    for t in mine:
         conds.append(tracking.Condition("risk", f"kill_{t.kind}", "critical", "キルスイッチ：" + t.reason))
     ch = mlops.challengers(con, pair, tf_key)
     for c in ch[ch["status"] == "ready"].itertuples():
@@ -235,17 +232,18 @@ def log_strategy_signals(con, pair, tf_key, ind, weights, now, suppressed: bool 
     """前回処理した足より後に確定した足のシグナルを記録する。初回は最新の確定足の分だけ。
     エントリーは次の足の始値なので、ここでは「待機」として記録し、fill_entries で埋める。
     次のときは suppressed=1 と理由を付けて記録だけする（停止のルールの効果を後で確かめられるように）：
-    - suppressed=True（最大損失・キルスイッチで停止中。理由は reason）
+    - suppressed=True（キルスイッチで停止中。理由は reason）
     - シグナルが出た時刻（足が確定した時刻）が重要な経済指標の前後（event_filter を渡したとき）
-    - そのシグナルの日（日本時間）に、口座全体でもう max_per_day 回シグナルを出していた（キルスイッチの「1日の回数」。
-      その日の停止を手動で解除していれば止めない）"""
+    - そのシグナルの日（日本時間）に、この通貨ペアでもう max_per_day 回シグナルを出していた（キルスイッチの「1日の回数」。
+      上限は通貨ペアごと。その日の停止を手動で解除していれば止めない）"""
     from . import paper
     used: dict[pd.Timestamp, int] = {}
-    released_days: set[str] = set()
+    released: set[str] = set()
     if max_per_day is not None:
         el = paper.eligible(con)
+        el = el[el["pair"] == pair]
         used = ((el["signal_time"] + tracking.JST).dt.normalize()).value_counts().to_dict() if len(el) else {}
-        released_days = {k.split(":", 1)[1] for k in killswitch.released_keys(con) if k.startswith("frequency:")}
+        released = killswitch.released_keys(con)
     n = len(ind)
     last = tracking.get_state(con, pair, tf_key, "strategy_last_bar")
     start = n - 1 if last is None else int(ind.index.searchsorted(pd.Timestamp(last), side="right"))
@@ -267,8 +265,8 @@ def log_strategy_signals(con, pair, tf_key, ind, weights, now, suppressed: bool 
                 why = f"経済指標の前後（{e.name}・日本時間 {e.jst_label()}）"
         if not why and max_per_day is not None:
             day = (ind.index[i] + tracking.JST).normalize()
-            if used.get(day, 0) >= max_per_day and f"{day:%Y-%m-%d}" not in released_days:
-                why = f"1日のシグナルの回数の上限（{max_per_day}回。キルスイッチ）"
+            if used.get(day, 0) >= max_per_day and killswitch.frequency_key(pair, day) not in released:
+                why = f"{pair} の1日のシグナルの回数の上限（{max_per_day}回。キルスイッチ）"
             else:
                 used[day] = used.get(day, 0) + 1
         rows.append((pair, tf_key, key, ts_str(ind.index[i]), d, float(atr[i]), max_bars,

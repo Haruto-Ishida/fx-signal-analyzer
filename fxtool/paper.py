@@ -21,8 +21,20 @@ from . import account, tracking
 from .config import PAIRS, TIMEFRAMES, pip_size
 from .settings import Settings
 
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS paper_log (
+    signal_id INTEGER PRIMARY KEY,   -- signal_log の id
+    pair TEXT NOT NULL, tf TEXT NOT NULL, source TEXT NOT NULL,
+    entry_time TEXT NOT NULL, exit_time TEXT, direction INTEGER NOT NULL,
+    requested_units REAL,            -- レバレッジの上限がなければ取っていた数量
+    units REAL NOT NULL,             -- 実際に取った数量（0 = 見送り）
+    sizing_status TEXT NOT NULL,     -- 通常 / 数量を減らした / 見送り
+    note TEXT, pips REAL, pnl_jpy REAL, recorded_at TEXT NOT NULL
+);
+"""
+
 ELIGIBLE_SQL = """
-    SELECT pair, tf, source, signal_time, direction, entry, sl, tp, status, exit_time, pips, meta_decision
+    SELECT id AS signal_id, pair, tf, source, signal_time, direction, entry, sl, tp, status, exit_time, pips, meta_decision
     FROM signal_log
     WHERE source NOT LIKE 'ml\\_%' ESCAPE '\\' AND suppressed = 0 AND entry_basis = 'next_open'
       AND (meta_decision IS NULL OR meta_decision != '見送り')
@@ -42,9 +54,10 @@ def trades(con: sqlite3.Connection) -> pd.DataFrame:
     df = df[df["status"].isin(tracking.DONE) & df["entry"].notna() & df["pips"].notna()]
     if df.empty:
         return pd.DataFrame(columns=["entry_time", "exit_time", "dir", "entry", "sl", "pips", "ticker", "pip",
-                                     "pair", "tf", "source"])
+                                     "pair", "tf", "source", "signal_id"])
     bar = df["tf"].map(lambda k: TIMEFRAMES[k].bar)
     return pd.DataFrame({
+        "signal_id": df["signal_id"],
         "entry_time": df["signal_time"] + bar,   # 次の足の始値
         "exit_time": df["exit_time"], "dir": df["direction"], "entry": df["entry"], "sl": df["sl"],
         "pips": df["pips"], "ticker": df["pair"].map(PAIRS), "pip": df["pair"].map(lambda p: pip_size(PAIRS[p])),
@@ -60,10 +73,35 @@ def build(con: sqlite3.Connection, s: Settings, usdjpy: float | None) -> account
                             s.paper.monthly_deposit, s.sizing.max_leverage, usdjpy)
 
 
-def signals_today(con: sqlite3.Connection, now: pd.Timestamp) -> int:
-    """日本時間の今日に出した（停止中でない）新しいシグナルの数（口座全体）。"""
+def save_log(con: sqlite3.Connection, acc: account.AccountResult, now: pd.Timestamp) -> int:
+    """ペーパー口座の取引ごとの数量（見送り・数量を減らしたものを含む）を記録する。
+    すでに記録したシグナルは書き換えない（あとで設定を変えても、その時点の記録が残るように）。"""
+    con.executescript(SCHEMA)
+    t = acc.trades
+    if t.empty or "units" not in t:
+        return 0
+    before = con.total_changes
+    con.executemany(
+        """INSERT OR IGNORE INTO paper_log (signal_id, pair, tf, source, entry_time, exit_time, direction,
+           requested_units, units, sizing_status, note, pips, pnl_jpy, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(int(r.signal_id), r.pair, r.tf, r.source, tracking.ts_str(r.entry_time), tracking.ts_str(r.exit_time),
+          int(r.dir), float(r.requested_units), float(r.units), r.sizing_status, r.note, float(r.pips),
+          None if pd.isna(r.pnl_jpy) else float(r.pnl_jpy), tracking.ts_str(now)) for r in t.itertuples()])
+    con.commit()
+    return con.total_changes - before
+
+
+def load_log(con: sqlite3.Connection) -> pd.DataFrame:
+    con.executescript(SCHEMA)
+    return pd.read_sql_query("SELECT * FROM paper_log ORDER BY entry_time DESC", con,
+                             parse_dates=["entry_time", "exit_time", "recorded_at"])
+
+
+def signals_today(con: sqlite3.Connection, now: pd.Timestamp) -> dict[str, int]:
+    """日本時間の今日に出した（停止中でない）新しいシグナルの数（通貨ペアごと）。"""
     df = eligible(con)
     if df.empty:
-        return 0
+        return {}
     today = (now + tracking.JST).normalize()
-    return int(((df["signal_time"] + tracking.JST) >= today).sum())
+    return df[(df["signal_time"] + tracking.JST) >= today].groupby("pair").size().astype(int).to_dict()

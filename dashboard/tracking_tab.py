@@ -12,7 +12,7 @@ import streamlit as st
 from fxtool import backtest as bt
 from fxtool import data, ml_eval, strategies, tracking
 from fxtool.config import (
-    DAILY_MAX_LOSS_R, LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, ML_HORIZON, TRACKING, WEEKLY_MAX_LOSS_R,
+    LIVE_WEIGHT_MIN_TRADES, LIVE_WEIGHT_WINDOW, ML_HORIZON, TRACKING,
 )
 from fxtool.jobs import RISK
 
@@ -109,22 +109,26 @@ def render(ctx: Context) -> None:
             }), hide_index=True, width="stretch")
 
     # ---------------- 最大損失 ----------------
-    st.markdown("### ② 最大損失（1日・1週間）")
+    st.markdown("### ② 新しいシグナルの停止")
     h = ctx.halt or tracking.Halt(False, "", 0.0, 0.0)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("今日の損益（日本時間）", f"{h.day_r:+.1f}R", help=f"上限 −{DAILY_MAX_LOSS_R:g}R")
-    c2.metric("今週の損益（月曜から）", f"{h.week_r:+.1f}R", help=f"上限 −{WEEKLY_MAX_LOSS_R:g}R")
-    c3.metric("新しいシグナル", "停止中" if h.active else "出しています")
+    n_supp = int(sl["suppressed"].sum()) if "suppressed" in sl else 0
+    c1, c2 = st.columns(2)
+    c1.metric("新しいシグナル", "停止中" if h.active else "出しています")
+    c2.metric("停止中として記録したシグナル（この通貨ペア・時間足）", f"{n_supp}件")
     if h.active:
         st.error(h.reason)
-    n_supp = int(sl["suppressed"].sum()) if "suppressed" in sl else 0
     st.caption(
-        f"1回の損切り幅を 1R（口座残高の約1%）として、本番の記録（全戦略）で決済した損益を合計しています。"
-        f"今日 −{DAILY_MAX_LOSS_R:g}R・今週 −{WEEKLY_MAX_LOSS_R:g}R に達したら、その期間は新しいシグナルを出さず、"
-        f"「停止中」として記録だけします（これまでに停止中に記録したシグナル：{n_supp}件）。"
-        "このほか、ペーパー口座の損失（%）・連敗・取引の回数によるキルスイッチと、経済指標の前後の停止もあります"
-        "（「💰 ペーパー口座」タブ）。上の「停止中」は、それらをすべてまとめた状態です。"
+        "キルスイッチ（ペーパー口座の1日の損失3%・1週間6%・5連敗・1日の回数の上限）と、経済指標の前後で、"
+        "新しいシグナルを止めます。止めたシグナルも「停止中」として理由と一緒に記録します。くわしくは「💰 ペーパー口座」タブ。"
     )
+    if n_supp and "suppress_reason" in sl:
+        with st.expander("停止中として記録したシグナルと理由"):
+            s2 = sl[sl["suppressed"] == 1].sort_values("signal_time", ascending=False).head(50)
+            st.dataframe(pd.DataFrame({
+                "シグナルの足": s2["signal_time"].map(ctx.label), "戦略": s2["source"],
+                "方向": s2["direction"].map({1: "買い", -1: "売り"}),
+                "理由": s2["suppress_reason"].fillna("（理由の記録を始める前）"),
+            }), hide_index=True, width="stretch")
 
     # ---------------- 重み ----------------
     st.markdown(f"### ③ 戦略の重み（本番の記録の直近{LIVE_WEIGHT_WINDOW}回から計算）")

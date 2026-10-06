@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from fxtool import data, killswitch
+from fxtool import data, killswitch, paper
 
 from .common import JST, Context
 
@@ -40,7 +40,9 @@ def render(ctx: Context) -> None:
         c1.metric("今日の損失", f"{max(kill.day_loss_pct, 0):.1f}%", help=f"上限 {ks.daily_loss_pct:g}%（その日の始まりの残高に対して）")
         c2.metric("今週の損失", f"{max(kill.week_loss_pct, 0):.1f}%", help=f"上限 {ks.weekly_loss_pct:g}%（月曜の始まりの残高に対して）")
         c3.metric("いまの連敗", f"{kill.streak}回", help=f"上限 {ks.max_consecutive_losses}回")
-        c4.metric("今日のシグナル", f"{kill.signals_today}回", help=f"上限 {ks.max_signals_per_day}回")
+        cap = s.signal_cap(ctx.pair)
+        c4.metric(f"今日のシグナル（{ctx.pair}）", f"{kill.signals_today.get(ctx.pair, 0)}回",
+                  help=f"上限 {cap}回（過去のデータで「100日に1日くらいしか起きない回数」。通貨ペアごと）")
         if kill.active:
             for t in kill.trips:
                 st.error(f"⛔ {t.reason}（自動で解除：日本時間 {(t.until + JST):%m/%d %H:%M}）")
@@ -59,12 +61,19 @@ def render(ctx: Context) -> None:
         st.caption(
             "どれか1つに達したら、その期間は新しいシグナルを出さず「停止中」として記録だけします："
             f"1日の損失 {ks.daily_loss_pct:g}%（その日の終わりまで）・1週間の損失 {ks.weekly_loss_pct:g}%（その週の終わりまで）・"
-            f"{ks.max_consecutive_losses}連敗（最後の負けから24時間）・1日のシグナル {ks.max_signals_per_day}回（その日の終わりまで）。"
-            "日付は日本時間です。数値は `settings.toml` の `[kill_switch]` で変更できます。"
+            f"{ks.max_consecutive_losses}連敗（最後の負けから24時間）・1日のシグナルの回数の上限（通貨ペアごと。その日の終わりまで、"
+            "その通貨ペアだけ）。日付は日本時間です。数値は `settings.toml` の `[kill_switch]`・`[signal_caps]` で変更できます。"
             "このほか、重要な経済指標の前後"
             f"（発表の{s.event_filter.minutes_before}分前〜{s.event_filter.minutes_after}分後。時刻が決まっていない日銀会合は前後"
             f"{s.event_filter.unfixed_window_minutes}分）も新しいシグナルを止めます。"
         )
+        with st.expander("通貨ペアごとの「1日のシグナルの回数」の上限"):
+            from fxtool.config import PAIRS
+            st.dataframe(pd.DataFrame({"通貨ペア": list(PAIRS), "上限（回）": [s.signal_cap(p) for p in PAIRS],
+                                       "今日の回数": [kill.signals_today.get(p, 0) for p in PAIRS]}),
+                         hide_index=True, width="stretch")
+            st.caption("過去の開発用データ（1時間足と日足の5つの戦略の合計）で、「1日の回数がこの値以上になる日が100日に1日以下」"
+                       "になる最小の回数です（2026-10-07 に計算）。")
 
     # ---------------- 口座 ----------------
     st.markdown("### ② 口座の成績")
@@ -90,5 +99,34 @@ def render(ctx: Context) -> None:
         "決済（日本時間）": (pd.DatetimeIndex(t["exit_time"]) + JST).strftime("%m/%d %H:%M"),
         "通貨ペア": t.get("pair", ""), "時間足": t.get("tf", ""), "戦略": t.get("source", ""),
         "方向": t["dir"].map({1: "買い", -1: "売り"}), "数量": t["units"].map(lambda u: f"{u:,.0f}" if u else "見送り"),
+        "本来の数量": t["requested_units"].map(lambda u: f"{u:,.0f}"), "扱い": t["sizing_status"],
         "損益(pips)": t["pips"].map(lambda x: f"{x:+.1f}"), "損益(円)": t["pnl_jpy"].map(_yen), "メモ": t["note"],
     }), hide_index=True, width="stretch")
+
+    # ---------------- 見送り・数量を減らした取引 ----------------
+    st.markdown("### ③ 見送り・数量を減らした取引の記録")
+    con = data.connect()
+    try:
+        log = paper.load_log(con)
+    finally:
+        con.close()
+    adj = log[log["sizing_status"] != "通常"] if len(log) else log
+    c1, c2, c3 = st.columns(3)
+    c1.metric("記録した取引", f"{len(log)}件")
+    c2.metric("数量を減らした", f"{int((log['sizing_status'] == '数量を減らした').sum()) if len(log) else 0}件")
+    c3.metric("見送り", f"{int((log['sizing_status'] == '見送り').sum()) if len(log) else 0}件")
+    st.caption(
+        "1回の損失の目安（残高の1%）どおりに取ると実効レバレッジの上限（5倍）を超える取引は、数量を減らすか、"
+        "1,000通貨も取れなければ見送ります。それぞれの取引を、決済したときの数量で記録しています"
+        "（あとで設定を変えても、記録は書き換えません）。"
+    )
+    if len(adj):
+        st.dataframe(pd.DataFrame({
+            "エントリー（日本時間）": (pd.DatetimeIndex(adj["entry_time"]) + JST).strftime("%Y/%m/%d %H:%M"),
+            "通貨ペア": adj["pair"], "時間足": adj["tf"], "戦略": adj["source"],
+            "方向": adj["direction"].map({1: "買い", -1: "売り"}), "扱い": adj["sizing_status"],
+            "本来の数量": adj["requested_units"].map(lambda u: f"{u:,.0f}"), "実際の数量": adj["units"].map(lambda u: f"{u:,.0f}"),
+            "理由": adj["note"], "損益(pips)": adj["pips"].map(lambda x: f"{x:+.1f}"),
+        }), hide_index=True, width="stretch")
+    else:
+        st.info("見送り・数量を減らした取引はまだありません。")

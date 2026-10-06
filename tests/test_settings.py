@@ -7,7 +7,19 @@ def test_project_settings_file_loads_without_warnings():
     assert s.paper.initial_balance == 100_000
     assert s.kill_switch.max_consecutive_losses == 5 and s.kill_switch.max_signals_per_day == 10
     assert s.kill_switch.daily_loss_pct == 3.0 and s.kill_switch.weekly_loss_pct == 6.0
-    assert s.trial_budget.ga_full_search == 500 and s.trial_budget.ga_weekly_search == 100
+    assert s.trial_budget.ga_full_search == 500 and s.trial_budget.ga_weekly_search == 150
+    assert s.trial_budget.ga_weekly_enabled is True and s.trial_budget.ga_interval_weeks == 3
+    # 2026-10-07 に計算した、通貨ペアごとの1日のシグナルの回数の上限
+    assert s.signal_caps == {"USD/JPY": 13, "EUR/JPY": 13, "GBP/JPY": 13, "AUD/JPY": 13,
+                             "EUR/USD": 14, "GBP/USD": 14, "AUD/USD": 14}
+    assert s.signal_cap("USD/JPY") == 13 and s.signal_cap("XXX/YYY") == 10
+
+
+def test_signal_caps_validation(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text('[signal_caps]\n"USD/JPY" = 12\n"EUR/USD" = "たくさん"\n"GBP/USD" = 0\n', encoding="utf-8")
+    s = settings.load(p)
+    assert s.signal_caps == {"USD/JPY": 12} and len(s.warnings) == 2
 
 
 def test_missing_values_use_defaults_and_bad_values_are_reported(tmp_path):

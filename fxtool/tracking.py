@@ -173,6 +173,9 @@ def migrate(con: sqlite3.Connection) -> None:
         con.execute("ALTER TABLE signal_log ADD COLUMN suppress_reason TEXT")
     con.executescript("""CREATE TABLE IF NOT EXISTS kill_switch_releases (
         key TEXT PRIMARY KEY, released_at TEXT NOT NULL, note TEXT);""")
+    # 2026-10-07：GA の評価した順の適応度（何通り目で最良が見つかったかのグラフ用）
+    if "trace" not in _columns(con, "ga_runs"):
+        con.execute("ALTER TABLE ga_runs ADD COLUMN trace TEXT")
     # Step 6：GA の候補の検証結果
     ga_cols = _columns(con, "ga_candidates")
     for c, typ in (("verdict", "TEXT"), ("reason", "TEXT"), ("wf_total", "REAL"), ("wf_n", "INTEGER"),
@@ -291,37 +294,12 @@ def live_performance(closed: pd.DataFrame, window: int, min_trades: int) -> list
 
 @dataclass
 class Halt:
+    """画面で使う「新しいシグナルを止めているか」のまとめ（キルスイッチ・経済指標）。
+    以前の R で数える最大損失（1日2R・1週間5R）は、2026-10-07 のユーザーの決定で外した（day_r・week_r は互換のため残している）。"""
     active: bool
     reason: str
-    day_r: float      # 日本時間の今日の損益（R）
-    week_r: float     # 日本時間の今週（月曜から）の損益（R）
-
-
-def r_multiple(closed: pd.DataFrame, sl_atr: float, pip: float) -> pd.Series:
-    """損益を「1回の損切り幅（1R）」の何倍かで表す。1R は口座残高の許容損失（初期値 1%）に相当する。"""
-    return closed["pips"] / (sl_atr * closed["atr"] / pip)
-
-
-def loss_halt(closed: pd.DataFrame, now: pd.Timestamp, sl_atr: float, pip: float, daily_max: float,
-              weekly_max: float) -> Halt:
-    """日本時間のその日・その週に決済した本番の記録の損益が上限に達したら、新しいシグナルを止める。"""
-    if closed.empty:
-        return Halt(False, "", 0.0, 0.0)
-    jst_now = now + JST
-    today = jst_now.normalize()
-    week_start = today - pd.Timedelta(days=today.dayofweek)
-    exit_jst = pd.DatetimeIndex(closed["exit_time"]) + JST
-    r = r_multiple(closed, sl_atr, pip).to_numpy()
-    day_r = float(r[exit_jst >= today].sum())
-    week_r = float(r[exit_jst >= week_start].sum())
-    eps = 1e-9  # 小数の計算の誤差（例：−1.9999999999999998）で上限の判定がずれないように
-    if day_r <= -daily_max + eps:
-        return Halt(True, f"今日（日本時間）の損失が {day_r:+.1f}R に達したため、今日は新しいシグナルを出しません"
-                          f"（上限 −{daily_max:g}R ＝ 口座残高の約{daily_max:g}%）", day_r, week_r)
-    if week_r <= -weekly_max + eps:
-        return Halt(True, f"今週（日本時間の月曜から）の損失が {week_r:+.1f}R に達したため、今週は新しいシグナルを出しません"
-                          f"（上限 −{weekly_max:g}R ＝ 口座残高の約{weekly_max:g}%）", day_r, week_r)
-    return Halt(False, "", day_r, week_r)
+    day_r: float = 0.0
+    week_r: float = 0.0
 
 
 def meta_conditions(registry: pd.DataFrame, signals: pd.DataFrame) -> list[Condition]:

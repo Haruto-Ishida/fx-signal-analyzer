@@ -165,25 +165,29 @@ def test_outcomes_are_filled_correctly(world):
         assert w.loc[src, "recent_n"] == min(n, 50)
 
 
-def test_max_loss_halts_new_signals(world):
+def test_daily_loss_kill_switch_halts_new_signals(world):
+    """ペーパー口座の今日（日本時間）の損失が 3% に達したら、新しいシグナルは「停止中」として記録だけする。"""
     world.cycle()
     world.advance(100)
-    # 今日（日本時間）すでに損切りが3回あった、という本番の記録を入れる（3R の損失）
-    today = world.now - pd.Timedelta(minutes=10)
-    for k in range(3):
+    # 今日（日本時間）、重ならない時間に損切りが4回あった、という本番の記録を入れる
+    # 1回：1% のリスク → 損切り幅 0.3円で 3,000通貨 → 損失 900円。4回で 3,600円 ＝ 3.6%
+    for k in range(4):
+        sig = world.now.floor("h") - pd.Timedelta(hours=5 - k)
+        ext = sig + pd.Timedelta(hours=1, minutes=20)
         world.con.execute(
             """INSERT INTO signal_log (pair, tf, source, signal_time, direction, entry, sl, tp, atr, max_bars, logged_at,
                status, exit_time, exit_price, pips, entry_basis)
                VALUES (?, ?, 'ma_cross', ?, 1, 150, 149.7, 150.6, 0.2, 48, ?, '損切り', ?, 149.7, -30.0, 'next_open')""",
-            (PAIR, TF, f"2019-01-0{k + 1} 00:00:00", "2019-01-01 00:00:00", today.strftime("%Y-%m-%d %H:%M:%S")))
+            (PAIR, TF, sig.strftime("%Y-%m-%d %H:%M:%S"), "2019-01-01 00:00:00", ext.strftime("%Y-%m-%d %H:%M:%S")))
     world.con.commit()
     r = world.cycle()
-    assert r.halted and "今日" in r.halted
+    assert r.halted and "今日" in r.halted and "3.6%" in r.halted
     new = tracking.load_signal_log(world.con, PAIR, TF)
     new = new[new["signal_time"] > FULL.index[START - 1]]
-    assert len(new) > 0 and (new["suppressed"] == 1).all()
+    new = new[new["logged_at"] == world.now]
+    assert len(new) > 0 and (new["suppressed"] == 1).all() and new["suppress_reason"].str.contains("3.6%").all()
     alerts = tracking.load_alerts(world.con, PAIR, TF, active_only=True)
-    assert "max_loss" in set(alerts["kind"])
+    assert "kill_daily_loss" in set(alerts["kind"]) and "max_loss" not in set(alerts["kind"])  # R の基準は外した
 
 
 def test_throttle_and_job_runs(world):
@@ -228,22 +232,6 @@ def test_live_performance_weights():
     assert perf["ma_cross"].weight > perf["rsi_reversal"].weight
     assert perf["rsi_reversal"].z == 0
     assert np.mean([r.weight for r in perf.values()]) == pytest.approx(1.0)
-
-
-def test_loss_halt_uses_japan_time_day_and_week():
-    def closed(times, pips):
-        return pd.DataFrame({"exit_time": pd.to_datetime(times), "pips": pips, "atr": 0.2})  # 1R = 30 pips
-
-    now = pd.Timestamp("2026-10-07 03:00")  # 水曜 日本時間12時
-    h = tracking.loss_halt(closed(["2026-10-07 01:00", "2026-10-06 16:00"], [-30, -30]), now, 1.5, 0.01, 2, 5)
-    assert h.active and h.day_r == pytest.approx(-2)  # 前日 UTC 16時 = 日本時間の今日 1時
-    h2 = tracking.loss_halt(closed(["2026-10-06 14:00"], [-60]), now, 1.5, 0.01, 2, 5)
-    assert not h2.active and h2.day_r == 0 and h2.week_r == pytest.approx(-2)  # 日本時間の昨日
-    week = closed(["2026-10-05 01:00", "2026-10-06 01:00", "2026-10-06 02:00"], [-60, -60, -45])
-    h3 = tracking.loss_halt(week, now, 1.5, 0.01, 2, 5)
-    assert h3.active and "今週" in h3.reason and h3.week_r == pytest.approx(-5.5)
-    last_week = closed(["2026-10-04 10:00"], [-300])  # 日曜 = 先週
-    assert not tracking.loss_halt(last_week, now, 1.5, 0.01, 2, 5).active
 
 
 def test_alert_sync_dedupes_and_resolves(tmp_path):

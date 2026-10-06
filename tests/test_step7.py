@@ -25,20 +25,20 @@ NOW = pd.Timestamp("2026-10-07 03:00")  # 日本時間 10/7（水）12:00
 def test_daily_loss_trips_until_end_of_day_and_can_be_released():
     t = tr([("2026-10-07 01:00", -1500), ("2026-10-07 02:00", -1600)])     # 今日 −3,100円
     d = daily([("2026-10-06", 100_000), ("2026-10-07", 96_900)])
-    s = killswitch.evaluate(t, d, 100_000, 0, NOW, KS)
+    s = killswitch.evaluate(t, d, 100_000, {}, NOW, KS)
     assert s.active and [x.kind for x in s.trips] == ["daily_loss"]
     assert s.day_loss_pct == pytest.approx(3.1)
     assert s.trips[0].until == pd.Timestamp("2026-10-07 15:00")             # 日本時間 10/8 0:00
-    assert not killswitch.evaluate(t, d, 100_000, 0, pd.Timestamp("2026-10-07 15:00"), KS).active  # 翌日は自動で解除
-    r = killswitch.evaluate(t, d, 100_000, 0, NOW, KS, {s.trips[0].key})
+    assert not killswitch.evaluate(t, d, 100_000, {}, pd.Timestamp("2026-10-07 15:00"), KS).active  # 翌日は自動で解除
+    r = killswitch.evaluate(t, d, 100_000, {}, NOW, KS, {s.trips[0].key})
     assert not r.active and r.released[0].kind == "daily_loss"
     # 2.9% なら止まらない
-    assert not killswitch.evaluate(tr([("2026-10-07 01:00", -2900)]), d, 100_000, 0, NOW, KS).active
+    assert not killswitch.evaluate(tr([("2026-10-07 01:00", -2900)]), d, 100_000, {}, NOW, KS).active
 
 
 def test_daily_loss_uses_balance_at_start_of_day():
     d = daily([("2026-10-05", 100_000), ("2026-10-06", 50_000)])  # 昨日の終わりに 5万円
-    s = killswitch.evaluate(tr([("2026-10-07 01:00", -1600)]), d, 100_000, 0, NOW, KS)
+    s = killswitch.evaluate(tr([("2026-10-07 01:00", -1600)]), d, 100_000, {}, NOW, KS)
     assert s.day_loss_pct == pytest.approx(3.2) and s.active
 
 
@@ -47,7 +47,7 @@ def test_weekly_loss_counts_from_monday_jst():
     t = tr([("2026-10-04 14:00", -5000), ("2026-10-05 02:00", -2000), ("2026-10-06 02:00", -2000),
             ("2026-10-06 05:00", -2100)])
     d = daily([("2026-10-04", 95_000), ("2026-10-05", 93_000), ("2026-10-06", 88_900)])
-    s = killswitch.evaluate(t, d, 100_000, 0, NOW, KS)
+    s = killswitch.evaluate(t, d, 100_000, {}, NOW, KS)
     assert s.week_loss_pct == pytest.approx(6100 / 95_000 * 100)
     assert [x.kind for x in s.trips] == ["weekly_loss"]
     assert s.trips[0].until == pd.Timestamp("2026-10-11 15:00")             # 日本時間 10/12（月）0:00
@@ -57,31 +57,35 @@ def test_consecutive_losses_trip_for_24h_then_reset():
     base = pd.Timestamp("2026-10-06 00:00")
     rows = [(base + pd.Timedelta(hours=i), -100) for i in range(5)]
     t = tr(rows)
-    s = killswitch.evaluate(t, None, 100_000, 0, base + pd.Timedelta(hours=5), KS)
+    s = killswitch.evaluate(t, None, 100_000, {}, base + pd.Timedelta(hours=5), KS)
     assert [x.kind for x in s.trips] == ["consecutive"] and s.streak == 0
     assert s.trips[0].until == base + pd.Timedelta(hours=28)
-    assert not killswitch.evaluate(t, None, 100_000, 0, base + pd.Timedelta(hours=28), KS).active
+    assert not killswitch.evaluate(t, None, 100_000, {}, base + pd.Timedelta(hours=28), KS).active
     # 4連敗のあとに勝ちがあれば数え直し
     t2 = tr(rows[:4] + [(base + pd.Timedelta(hours=4), 50)] + [(base + pd.Timedelta(hours=5 + i), -100) for i in range(4)])
-    s2 = killswitch.evaluate(t2, None, 100_000, 0, base + pd.Timedelta(hours=10), KS)
+    s2 = killswitch.evaluate(t2, None, 100_000, {}, base + pd.Timedelta(hours=10), KS)
     assert not s2.active and s2.streak == 4
     # 止まっている間に決済した負けは数えない（止まる前に入っていた取引）
     t3 = tr(rows + [(base + pd.Timedelta(hours=6 + i), -100) for i in range(5)])
-    s3 = killswitch.evaluate(t3, None, 100_000, 0, base + pd.Timedelta(hours=29), KS)
+    s3 = killswitch.evaluate(t3, None, 100_000, {}, base + pd.Timedelta(hours=29), KS)
     assert not s3.active and s3.streak == 0
 
 
 def test_frequency_trips_at_the_limit():
     empty = pd.DataFrame(columns=["exit_time", "pnl_jpy", "units"])
-    assert not killswitch.evaluate(empty, None, 100_000, 9, NOW, KS).active
-    s = killswitch.evaluate(empty, None, 100_000, 10, NOW, KS)
-    assert [x.kind for x in s.trips] == ["frequency"]
+    caps = {"USD/JPY": 13, "EUR/USD": 14}
+    assert not killswitch.evaluate(empty, None, 100_000, {"USD/JPY": 12, "EUR/USD": 13}, NOW, KS, caps=caps).active
+    s = killswitch.evaluate(empty, None, 100_000, {"USD/JPY": 13, "EUR/USD": 13, "GBP/JPY": 10}, NOW, KS, caps=caps)
+    # 上限は通貨ペアごと（表にない通貨ペアは max_signals_per_day = 10）。止まるのはその通貨ペアだけ
+    assert [(x.kind, x.pair) for x in s.trips] == [("frequency", "GBP/JPY"), ("frequency", "USD/JPY")]
+    assert s.trips_for("EUR/USD") == [] and [x.pair for x in s.trips_for("USD/JPY")] == ["USD/JPY"]
+    assert s.trips[1].key == "frequency:USD/JPY:2026-10-07"
 
 
 def test_settings_change_the_limits():
     t = tr([("2026-10-07 01:00", -1500)])
-    assert killswitch.evaluate(t, None, 100_000, 0, NOW, KillSwitch(daily_loss_pct=1.0)).active
-    assert not killswitch.evaluate(t, None, 100_000, 0, NOW, KS).active
+    assert killswitch.evaluate(t, None, 100_000, {}, NOW, KillSwitch(daily_loss_pct=1.0)).active
+    assert not killswitch.evaluate(t, None, 100_000, {}, NOW, KS).active
 
 
 # ---------------- 経済指標フィルター ----------------
@@ -153,7 +157,7 @@ def test_paper_takes_only_eligible_signals_and_combines_pairs(con):
     assert acc5.metrics["final"] == pytest.approx(100_000 + 3_000 * 0.30)
     # USD/JPY のレートがわからなければ、円のペアだけで計算する
     assert paper.build(con, Settings(), usdjpy=None).metrics["n"] == 1
-    assert paper.signals_today(con, pd.Timestamp("2026-10-05 10:00")) == 3
+    assert paper.signals_today(con, pd.Timestamp("2026-10-05 10:00")) == {"USD/JPY": 2, "EUR/USD": 1}
 
 
 def test_log_strategy_signals_marks_blackout_and_quota(con, monkeypatch):
@@ -164,12 +168,13 @@ def test_log_strategy_signals_marks_blackout_and_quota(con, monkeypatch):
     monkeypatch.setattr(strategies, "STRATEGIES", strategies.STRATEGIES[:1])
     monkeypatch.setattr(strategies, "signals", lambda ind_, s, p: sig)
     tracking.set_state(con, "USD/JPY", "1h", "strategy_last_bar", "2026-11-06 09:00:00")
-    # その日（日本時間 11/6）は、ほかのペアですでに 9 回出している → あと1回
+    # その日（日本時間 11/6）は、USD/JPY ですでに 9 回出している → あと1回（ほかの通貨ペアの回数は数えない）
     for k in range(9):
+        add_signal(con, "USD/JPY", "1d", "ma_cross", f"2026-11-06 0{k}:00:00", 1, 150.0, 149.8, 0.0, "進行中")
         add_signal(con, "EUR/JPY", "1h", "ma_cross", f"2026-11-06 0{k}:00:00", 1, 160.0, 159.8, 0.0, "進行中")
     n = jobs.log_strategy_signals(con, "USD/JPY", "1h", ind, {}, idx[-1], max_per_day=10, event_filter=EventFilter())
     assert n == 3
-    rows = con.execute("""SELECT signal_time, suppressed, suppress_reason FROM signal_log WHERE pair='USD/JPY'
+    rows = con.execute("""SELECT signal_time, suppressed, suppress_reason FROM signal_log WHERE pair='USD/JPY' AND tf='1h'
                           ORDER BY signal_time""").fetchall()
     # 10:00 の足（確定 11:00）は通常 → 10回目
     assert rows[0][:2] == ("2026-11-06 10:00:00", 0)
@@ -182,15 +187,15 @@ def test_log_strategy_signals_marks_blackout_and_quota(con, monkeypatch):
     ind2 = pd.DataFrame({"atr": [0.1, 0.1]}, index=idx2)
     monkeypatch.setattr(strategies, "signals", lambda ind_, s, p: pd.Series([0, 1], index=idx2))
     for k in range(9):
-        add_signal(con, "EUR/JPY", "1h", "ma_cross", f"2026-11-06 {16 + k % 1}:{k:02d}:00", 1, 160.0, 159.8, 0.0, "進行中")
+        add_signal(con, "USD/JPY", "1d", "ma_cross", f"2026-11-06 {16 + k % 1}:{k:02d}:00", 1, 150.0, 149.8, 0.0, "進行中")
     jobs.log_strategy_signals(con, "USD/JPY", "1h", ind2, {}, idx2[-1], max_per_day=10)
-    last = con.execute("SELECT suppressed, suppress_reason FROM signal_log WHERE pair='USD/JPY' ORDER BY signal_time DESC").fetchone()
+    last = con.execute("SELECT suppressed, suppress_reason FROM signal_log WHERE pair='USD/JPY' AND tf='1h' ORDER BY signal_time DESC").fetchone()
     assert last[0] == 1 and "回数の上限" in last[1]
-    con.execute("DELETE FROM signal_log WHERE pair='USD/JPY' AND signal_time='2026-11-06 17:00:00'")
+    con.execute("DELETE FROM signal_log WHERE pair='USD/JPY' AND tf='1h' AND signal_time='2026-11-06 17:00:00'")
     tracking.set_state(con, "USD/JPY", "1h", "strategy_last_bar", "2026-11-06 16:00:00")
-    killswitch.release(con, "frequency:2026-11-07", idx2[-1])
+    killswitch.release(con, killswitch.frequency_key("USD/JPY", pd.Timestamp("2026-11-07")), idx2[-1])
     jobs.log_strategy_signals(con, "USD/JPY", "1h", ind2, {}, idx2[-1], max_per_day=10)
-    last = con.execute("SELECT suppressed FROM signal_log WHERE pair='USD/JPY' ORDER BY signal_time DESC").fetchone()
+    last = con.execute("SELECT suppressed FROM signal_log WHERE pair='USD/JPY' AND tf='1h' ORDER BY signal_time DESC").fetchone()
     assert last[0] == 0
 
 
@@ -208,3 +213,36 @@ def test_release_is_recorded(con):
     now = pd.Timestamp("2026-10-07 03:00")
     killswitch.release(con, "daily_loss:2026-10-07", now)
     assert killswitch.released_keys(con) == {"daily_loss:2026-10-07"}
+
+
+def test_paper_log_records_skipped_and_reduced(con):
+    add_signal(con, "USD/JPY", "1h", "ma_cross", "2026-10-05 01:00:00", 1, 150.0, 149.85, 30.0, exit_time="2026-10-05 05:00:00")
+    add_signal(con, "EUR/USD", "1h", "ma_cross", "2026-10-05 02:00:00", -1, 1.10, 1.1015, -15.0, "損切り", "2026-10-05 06:00:00")
+    acc = paper.build(con, Settings(), usdjpy=150.0)
+    assert paper.save_log(con, acc, NOW) == 2
+    log = paper.load_log(con).set_index("pair")
+    assert log.loc["USD/JPY", "sizing_status"] == "数量を減らした"
+    assert (log.loc["USD/JPY", "requested_units"], log.loc["USD/JPY", "units"]) == (6000, 3000)
+    assert log.loc["USD/JPY", "note"].startswith("実効レバレッジの上限")
+    assert log.loc["EUR/USD", "sizing_status"] == "見送り" and log.loc["EUR/USD", "units"] == 0
+    # 一度記録したものは、設定を変えて計算し直しても書き換えない
+    from dataclasses import replace
+    wide = Settings(sizing=replace(Settings().sizing, max_leverage=25.0))
+    assert paper.save_log(con, paper.build(con, wide, usdjpy=150.0), NOW) == 0
+    assert paper.load_log(con).set_index("pair").loc["USD/JPY", "units"] == 3000
+
+
+def test_signal_cap_from_distribution():
+    import numpy as np
+    from fxtool import signal_caps
+    # 1日 0〜4回が同じ割合（各20%）なら、4回以上は 20%（> 1%）、5回以上は 0% → 上限 5
+    assert signal_caps.cap_from(np.array([0.2] * 5)) == (5, 0.0)
+    d = np.zeros(20)
+    d[5] = 0.985
+    d[12] = 0.010
+    d[15] = 0.005
+    cap, p = signal_caps.cap_from(d)
+    assert p <= 0.01 and cap == 13            # 12回以上は 1.5%（> 1%）、13回以上は 0.5%
+    # 2つの時間足の分布のたたみ込み（独立とみなす）
+    counts = pd.Series([1, 1, 2, 2])
+    assert np.allclose(signal_caps.distribution(counts), [0, 0.5, 0.5])

@@ -53,6 +53,7 @@ def simulate(trades: pd.DataFrame, ticker: str, pip: float, risk_pct: float, ini
 
     balance, deposits = float(initial), 0.0
     units = np.zeros(len(t))
+    wanted = np.zeros(len(t))   # レバレッジの上限がなければ取っていた数量（数量を減らした・見送ったかの確認用）
     pnl = np.full(len(t), np.nan)
     risk_jpy = np.full(len(t), np.nan)
     note = [""] * len(t)
@@ -68,6 +69,8 @@ def simulate(trades: pd.DataFrame, ticker: str, pip: float, risk_pct: float, ini
                 note[i] = "残高がなくなったため見送り"
                 continue
             row = t.iloc[i]
+            free = sizing.position_size(balance, risk_pct, row.entry, row.sl, tickers[i], usdjpy)
+            wanted[i] = free.units if free else 0
             sz = sizing.position_size(balance, risk_pct, row.entry, row.sl, tickers[i], usdjpy, max_leverage,
                                       sum(open_notional.values()))
             if sz is None or sz.units == 0:
@@ -85,7 +88,9 @@ def simulate(trades: pd.DataFrame, ticker: str, pip: float, risk_pct: float, ini
                 bankrupt = True
         flows.append((time, balance, deposits))
 
-    out = t.assign(units=units, pnl_jpy=pnl, loss_at_stop_jpy=risk_jpy, note=note)
+    status = np.where(units == 0, "見送り", np.where(units < wanted, "数量を減らした", "通常"))
+    out = t.assign(units=units, requested_units=wanted, pnl_jpy=pnl, loss_at_stop_jpy=risk_jpy, note=note,
+                   sizing_status=status)
     daily = _daily(flows, initial, start)
     return AccountResult(out, daily, _metrics(daily, initial, deposits, out, bankrupt))
 

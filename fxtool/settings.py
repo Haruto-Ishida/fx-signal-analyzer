@@ -52,8 +52,9 @@ class CostSettings:
 @dataclass(frozen=True)
 class TrialBudget:
     ga_full_search: int = 500
-    ga_weekly_search: int = 100
-    ga_weekly_enabled: bool = False  # 週末の自動の再探索（1年分の試行数をユーザーと相談するまでは止めておく）
+    ga_weekly_search: int = 150         # 定期的な再探索 1回あたり（前回の上位候補の周辺だけ）
+    ga_weekly_enabled: bool = True      # 定期的な再探索をするか
+    ga_interval_weeks: int = 3          # 再探索の間隔（週）。日本時間の土曜に行う
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,9 @@ LIMITS = {
     ("paper", "initial_balance"): (1_000, 1e10),
     # ユーザーの決定：本格的な探索は1回500通りまで、週末の再探索は1回100通りまで
     ("trial_budget", "ga_full_search"): (0, 500),
-    ("trial_budget", "ga_weekly_search"): (0, 100),
+    ("trial_budget", "ga_weekly_search"): (0, 150),
+    ("trial_budget", "ga_interval_weeks"): (1, 52),
+    ("kill_switch", "max_signals_per_day"): (1, 1000),
     ("papers", "max_results"): (1, 200),
 }
 
@@ -88,7 +91,11 @@ class Settings:
     costs: CostSettings = CostSettings()
     trial_budget: TrialBudget = TrialBudget()
     papers: Papers = Papers()
+    signal_caps: dict = field(default_factory=dict)  # 通貨ペアごとの1日のシグナルの回数の上限（[signal_caps]）
     warnings: tuple[str, ...] = field(default=(), compare=False)
+
+    def signal_cap(self, pair: str) -> int:
+        return int(self.signal_caps.get(pair, self.kill_switch.max_signals_per_day))
 
 
 _SECTIONS = {"paper": Paper, "sizing": Sizing, "kill_switch": KillSwitch, "event_filter": EventFilter,
@@ -142,4 +149,10 @@ def load(path: Path | None = None) -> Settings:
                 v = type(default)(clipped)
             values[f.name] = v
         parts[name] = cls(**values)
-    return Settings(**parts, warnings=tuple(warnings))
+    caps = {}
+    for pair, v in (raw.get("signal_caps") or {}).items():
+        if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 1000:
+            caps[pair] = v
+        else:
+            warnings.append(f"[signal_caps] {pair} の値「{v}」は 1〜1000 の整数ではないため、使いません")
+    return Settings(**parts, signal_caps=caps, warnings=tuple(warnings))

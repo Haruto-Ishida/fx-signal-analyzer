@@ -5,9 +5,10 @@
 - 1日の損失：日本時間のその日に決済した損益が、その日の始まりの残高の daily_loss_pct% 以上の損失 → その日の終わりまで
 - 1週間の損失：日本時間の月曜からの損益が、月曜の始まりの残高の weekly_loss_pct% 以上の損失 → その週の終わりまで
 - 連敗：max_consecutive_losses 回続けて負けた → 最後の負けから24時間（その後は連敗の数を0から数え直す）
-- 取引の回数：日本時間のその日の新しいシグナルが max_signals_per_day 回に達した → その日の終わりまで
+- 取引の回数：日本時間のその日の、その通貨ペアの新しいシグナルが上限（settings.toml の [signal_caps]。
+  過去のデータで「100日に1日くらいしか起きない回数」）に達した → その日の終わりまで、その通貨ペアだけ止める
 解除は、期間が過ぎたら自動。画面から手動でも解除できる（解除した記録は kill_switch_releases に残る）。
-以前からある「R（1回の損失の目安）で数える最大損失による停止」（tracking.loss_halt）も、そのまま併用する。
+以前の「R（1回の損失の目安）で数える最大損失（1日2R・1週間5R）」は、2026-10-07 のユーザーの決定で外した（% の基準にまとめた）。
 """
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ class Trip:
     key: str             # 手動で解除するときの目印（期間ごとに1つ）
     reason: str
     until: pd.Timestamp  # 自動で解除される時刻（UTC）
+    pair: str | None = None  # frequency のときだけ：止める通貨ペア（ほかは口座全体）
 
 
 @dataclass
@@ -42,7 +44,7 @@ class KillState:
     day_loss_pct: float = 0.0
     week_loss_pct: float = 0.0
     streak: int = 0
-    signals_today: int = 0
+    signals_today: dict = field(default_factory=dict)     # 通貨ペア → 今日の新しいシグナルの回数
 
     @property
     def active(self) -> bool:
@@ -52,6 +54,13 @@ class KillState:
     def reason(self) -> str:
         return " ／ ".join(t.reason for t in self.trips)
 
+    def trips_for(self, pair: str) -> list[Trip]:
+        """その通貨ペアの新しいシグナルを止めている停止（口座全体の停止＋その通貨ペアの回数の停止）。"""
+        return [t for t in self.trips if t.pair is None or t.pair == pair]
+
+    def reason_for(self, pair: str) -> str:
+        return " ／ ".join(t.reason for t in self.trips_for(pair))
+
 
 def _start_balance(daily: pd.DataFrame, initial: float, day_jst: pd.Timestamp) -> float:
     if daily is None or daily.empty:
@@ -60,10 +69,13 @@ def _start_balance(daily: pd.DataFrame, initial: float, day_jst: pd.Timestamp) -
     return float(before["balance"].iat[-1]) if len(before) else float(initial)
 
 
-def evaluate(trades: pd.DataFrame, daily: pd.DataFrame, initial: float, n_signals_today: int, now: pd.Timestamp,
-             ks: KillSwitch, released_keys: set[str] | frozenset[str] = frozenset()) -> KillState:
-    """trades は account.simulate の結果の trades（units, pnl_jpy, exit_time）。daily は日ごとの残高（日本時間の日付）。"""
-    st = KillState(signals_today=int(n_signals_today))
+def evaluate(trades: pd.DataFrame, daily: pd.DataFrame, initial: float, n_signals_today: dict[str, int],
+             now: pd.Timestamp, ks: KillSwitch, released_keys: set[str] | frozenset[str] = frozenset(),
+             caps: dict[str, int] | None = None) -> KillState:
+    """trades は account.simulate の結果の trades（units, pnl_jpy, exit_time）。daily は日ごとの残高（日本時間の日付）。
+    n_signals_today は通貨ペアごとの今日の回数、caps は通貨ペアごとの上限（ないペアは ks.max_signals_per_day）。"""
+    caps = caps or {}
+    st = KillState(signals_today=dict(n_signals_today))
     jst_now = now + JST
     today = jst_now.normalize()
     monday = today - pd.Timedelta(days=today.dayofweek)
@@ -104,13 +116,20 @@ def evaluate(trades: pd.DataFrame, daily: pd.DataFrame, initial: float, n_signal
         if until is not None and now < until:
             trips.append(last_trip)
 
-    if n_signals_today >= ks.max_signals_per_day:
-        trips.append(Trip("frequency", f"frequency:{today:%Y-%m-%d}",
-                          f"今日（日本時間）の新しいシグナルが {n_signals_today} 回に達しました（上限 {ks.max_signals_per_day} 回）。"
-                          "いつもより取引が多すぎるため、今日はこれ以上出しません", end_of_day))
+    for pair, n in sorted(n_signals_today.items()):
+        cap = int(caps.get(pair, ks.max_signals_per_day))
+        if n >= cap:
+            trips.append(Trip("frequency", frequency_key(pair, today),
+                              f"{pair} の今日（日本時間）の新しいシグナルが {n} 回に達しました（上限 {cap} 回＝過去のデータで"
+                              f"100日に1日くらいしか起きない回数）。いつもより多すぎるため、{pair} は今日これ以上出しません",
+                              end_of_day, pair))
     st.trips = [t for t in trips if t.key not in released_keys]
     st.released = [t for t in trips if t.key in released_keys]
     return st
+
+
+def frequency_key(pair: str, day_jst: pd.Timestamp) -> str:
+    return f"frequency:{pair}:{day_jst:%Y-%m-%d}"
 
 
 # ---------------- 記録 ----------------
@@ -136,5 +155,5 @@ def check(con: sqlite3.Connection, now: pd.Timestamp, s, usdjpy: float | None):
     from . import paper
     acc = paper.build(con, s, usdjpy)
     state = evaluate(acc.trades, acc.daily, s.paper.initial_balance, paper.signals_today(con, now), now,
-                     s.kill_switch, released_keys(con))
+                     s.kill_switch, released_keys(con), s.signal_caps)
     return acc, state

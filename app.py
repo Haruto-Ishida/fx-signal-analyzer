@@ -9,7 +9,7 @@ from dashboard.common import JST, Context
 from fxtool import data, events, indicators, jobs, killswitch, notify, tracking, trials
 from fxtool import settings as user_settings
 from fxtool.config import (
-    DAILY_MAX_LOSS_R, DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, PAIR_NAMES, PAIRS, TIMEFRAMES, WEEKLY_MAX_LOSS_R,
+    DEFAULT_BALANCE_JPY, DEFAULT_RISK_PCT, PAIR_NAMES, PAIRS, TIMEFRAMES,
     IndicatorParams, RiskParams, pip_size, price_digits,
 )
 
@@ -77,15 +77,11 @@ try:
     sched_gap = jobs.schedule_gap(con, data.now_utc())
 finally:
     con.close()
-closed = signal_log[signal_log["status"].isin(tracking.DONE)]
-# 本番の記録は初期値の損切り幅（jobs.RISK）で記録しているので、左の設定ではなく初期値で R を計算する
-r_halt = tracking.loss_halt(closed, data.now_utc(), jobs.RISK.sl_atr, pip_size(ticker), DAILY_MAX_LOSS_R,
-                            WEEKLY_MAX_LOSS_R)
-# 停止の理由をまとめる：R で数える最大損失・キルスイッチ（ペーパー口座全体）・経済指標の前後
+# 停止の理由をまとめる：キルスイッチ（ペーパー口座全体・この通貨ペアの回数）・経済指標の前後
 blackout = events.blackout(ticker, data.now_utc(), user_cfg.event_filter)
-stop = [x for x in (r_halt.reason if r_halt.active else "", kill.reason,
+stop = [x for x in (kill.reason_for(pair),
                     f"経済指標の前後（{blackout.name}・日本時間 {blackout.jst_label()}）のため" if blackout else "") if x]
-halt = tracking.Halt(bool(stop), " ／ ".join(stop), r_halt.day_r, r_halt.week_r)
+halt = tracking.Halt(bool(stop), " ／ ".join(stop), 0.0, 0.0)
 
 for w in user_cfg.warnings:
     st.warning(f"⚙️ 設定ファイル：{w}")

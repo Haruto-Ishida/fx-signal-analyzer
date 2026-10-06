@@ -20,7 +20,7 @@ max_leverage = 5.0
 [kill_switch]
 # どれか1つに達したら、その期間は新しいシグナルを止める（画面から手動で解除もできる）
 max_consecutive_losses = 5      # 連敗の回数
-max_signals_per_day = 10        # 1日（日本時間）の新しいシグナルの回数
+max_signals_per_day = 10        # 1日（日本時間）の新しいシグナルの回数（下の [signal_caps] にない通貨ペア用）
 daily_loss_pct = 3.0            # 1日の損失（ペーパー口座の残高に対する%）
 weekly_loss_pct = 6.0           # 1週間（月曜から）の損失（同上）
 
@@ -40,9 +40,11 @@ rollover_spread_multiplier = 2.0    # ロールオーバーの時間帯（NY市�
 [trial_budget]
 # 試す数の目安（研究ノート：試すほど偶然よく見えるものが見つかりやすい）
 ga_full_search = 500     # 本格的なGA探索 1回あたり
-ga_weekly_search = 100   # 週末の再探索 1回あたり（前回の上位候補の周辺だけ）
-# 週末の自動の再探索をするか（true / false）。1年で最大5,200通り増えるので、相談が終わるまでは false
-ga_weekly_enabled = false
+ga_weekly_search = 150   # 定期的な再探索 1回あたり（前回の上位候補の周辺のうち、まだ試していないものだけ。上限150）
+# 定期的な再探索をするか（true / false）
+ga_weekly_enabled = true
+# 再探索の間隔（週）。日本時間の土曜に行う
+ga_interval_weeks = 3
 
 [papers]
 # 論文ウォッチ：arXiv（論文の公開サイト）の公式 API から、新しい論文の情報（題名・著者・日付・概要・リンク）を集める
@@ -54,3 +56,15 @@ keywords = ["foreign exchange", "forex", "exchange rate forecasting", "currency 
 categories = ["q-fin.TR", "q-fin.ST", "q-fin.CP", "cs.LG", "stat.ML"]
 # 1回に集める最大の件数（1〜200）
 max_results = 50
+
+[signal_caps]
+# キルスイッチの「1日のシグナルの回数」の上限（通貨ペアごと。この回数に達したら、その日はそれ以上出さない）
+# 過去の開発用データで「100日に1日くらいしか起きない回数」として計算した値（2026-10-07、fxtool/signal_caps.py）
+# ここにない通貨ペアは [kill_switch] の max_signals_per_day を使う
+"USD/JPY" = 13   # 1日の平均 5.3回・13回以上の日は約0.7%
+"EUR/JPY" = 13   # 1日の平均 5.4回・13回以上の日は約0.7%
+"GBP/JPY" = 13   # 1日の平均 5.5回・13回以上の日は約1.0%
+"AUD/JPY" = 13   # 1日の平均 5.3回・13回以上の日は約0.5%
+"EUR/USD" = 14   # 1日の平均 5.4回・14回以上の日は約0.5%
+"GBP/USD" = 14   # 1日の平均 5.6回・14回以上の日は約1.0%
+"AUD/USD" = 14   # 1日の平均 5.5回・14回以上の日は約0.4%

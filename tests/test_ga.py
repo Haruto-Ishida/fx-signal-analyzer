@@ -1,4 +1,5 @@
 """Step 5：遺伝的アルゴリズム（GA）のテスト（合成データだけ。実データでの探索はしない）。"""
+import json
 import numpy as np
 import pandas as pd
 import pytest
@@ -170,29 +171,77 @@ def test_budget_is_capped_by_settings(tmp_db, monkeypatch):
     assert seen["budget"] == 500
 
 
-def test_weekly_search_is_off_by_default_and_only_on_weekends(tmp_db, tmp_path):
+def test_re_search_runs_every_3_weeks_on_saturday(tmp_db, tmp_path):
     from fxtool import ga_jobs, settings
     sat = pd.Timestamp("2026-10-10 03:00")  # 日本時間の土曜 12:00
-    off = settings.load()
-    assert off.trial_budget.ga_weekly_enabled is False
-    assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", sat, off)
-    p = tmp_path / "s.toml"
-    p.write_text("[trial_budget]\nga_weekly_enabled = true\n", encoding="utf-8")
-    on = settings.load(p)
+    on = settings.load()
+    assert on.trial_budget.ga_weekly_enabled is True and on.trial_budget.ga_interval_weeks == 3
     assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", sat, on)   # 本格的な探索の結果がまだない
     tmp_db.execute("""INSERT INTO ga_runs (pair, tf, kind, seed, budget, n_evaluated, started_at, origin)
-                      VALUES ('EUR/JPY', '1d', 'full', 1, 500, 500, '2026-10-01 00:00:00', 'dashboard')""")
-    assert ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", sat, on)
-    assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", pd.Timestamp("2026-10-08 03:00"), on)  # 木曜
-    assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", pd.Timestamp("2026-10-04 03:00"), on)  # 6日たっていない
-    assert ga_jobs.projected_trials_per_year(on) == 500 + 52 * 100
+                      VALUES ('EUR/JPY', '1d', 'full', 1, 500, 500, '2026-09-19 03:00:00', 'dashboard')""")
+    assert ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", sat, on)                                    # 3週間後の土曜
+    assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", pd.Timestamp("2026-10-03 03:00"), on)  # 2週間後の土曜
+    assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", pd.Timestamp("2026-10-11 03:00"), on)  # 日曜
+    assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", pd.Timestamp("2026-10-09 03:00"), on)  # 金曜
+    tmp_db.execute("""INSERT INTO ga_runs (pair, tf, kind, seed, budget, n_evaluated, started_at, origin)
+                      VALUES ('EUR/JPY', '1d', 'neighborhood', 1, 150, 150, '2026-10-10 02:00:00', 'schedule')""")
+    assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", sat, on)                                # 今日もう実行した
+    assert ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", pd.Timestamp("2026-10-31 01:00"), on)       # その3週間後
+    p = tmp_path / "s.toml"
+    p.write_text("[trial_budget]\nga_weekly_enabled = false\n", encoding="utf-8")
+    off = settings.load(p)
+    assert not ga_jobs.weekly_due(tmp_db, "EUR/JPY", "1d", pd.Timestamp("2026-10-31 01:00"), off)
+    assert ga_jobs.projected_trials_per_year(on) == 500 + 18 * 150
     assert ga_jobs.projected_trials_per_year(off) == 500
 
+
+def test_projection_is_capped_by_the_search_space():
+    from fxtool import ga_jobs, settings
+    s = settings.load()
+    p1 = ga_jobs.projection(86, s, 1)
+    p4 = ga_jobs.projection(86, s, 4)
+    assert p1["re_search_runs"] == 18 and p4["re_search_runs"] == 70
+    assert p1["naive"] == 86 + 500 + 18 * 150 and p4["naive"] == 86 + 500 + 70 * 150
+    assert p1["capped"] == p4["capped"] == 86 + ga_jobs.search_space_size()
+    assert 1 < p1["strict_capped"] <= p1["strict_naive"] < p4["strict_naive"]
+
+
+def test_convergence_and_budget_suggestion():
+    from fxtool import ga_jobs
+    trace = [0.1, 0.3, 0.2, 0.5, 0.4, 0.49, 0.5, 0.1] + [0.0] * 92
+    c = ga_jobs.convergence(trace)
+    assert c.best_at == 4 and c.n == 100 and c.best_so_far[-1] == 0.5
+    assert c.near_at == 4
+    c2 = ga_jobs.convergence([0.0] * 50 + [0.98, 1.0] + [0.0] * 448)
+    assert c2.best_at == 52 and c2.near_at == 51
+    assert ga_jobs.suggest_budget(c2, 150) == 30            # 52 の半分 → 30（下限）
+    assert ga_jobs.suggest_budget(ga_jobs.convergence([0.0] * 400 + [1.0]), 150) == 150  # 上限
+    assert ga_jobs.convergence([]) is None
+
+
+def test_re_search_skips_already_evaluated_and_trace_is_saved(tmp_db, monkeypatch):
+    from fxtool import ga_jobs
+    orig = ga.search
+    monkeypatch.setattr(ga, "search", lambda dev, *a, **k: orig(dev, *a, **{**k, "pop_size": 10}))
+    r1 = ga_jobs.run(tmp_db, "EUR/JPY", "1d", "full", seed=4, budget=30)
+    done1 = ga_jobs.evaluated_genomes(tmp_db, "EUR/JPY", "1d")
+    assert len(done1) == 30
+    trace = json.loads(tmp_db.execute("SELECT trace FROM ga_runs WHERE id=?", (r1,)).fetchone()[0])
+    assert len(trace) == 30
+    n1 = trials.count(tmp_db, "EUR/JPY", "1d")
+    r2 = ga_jobs.run(tmp_db, "EUR/JPY", "1d", "neighborhood", seed=5, budget=20)
+    new = {ga_jobs.genome_from_genes(json.loads(g)) for (g,) in tmp_db.execute("SELECT genes FROM ga_candidates WHERE run_id=?", (r2,))}
+    assert new and not (new & done1)                                    # 評価済みの組み合わせは評価し直さない
+    done2 = ga_jobs.evaluated_genomes(tmp_db, "EUR/JPY", "1d")
+    assert len(done2) == 50 and trials.count(tmp_db, "EUR/JPY", "1d") == n1 + 20   # 20通りすべて新しい組み合わせ
+    # 上位候補は、これまでのすべての回の中から選ぶ
+    best = tmp_db.execute("SELECT genes FROM ga_candidates ORDER BY fitness DESC LIMIT 1").fetchone()[0]
+    assert ga_jobs.previous_top(tmp_db, "EUR/JPY", "1d", 1) == [ga_jobs.genome_from_genes(json.loads(best))]
 
 def test_settings_reject_non_boolean_and_over_budget(tmp_path):
     from fxtool import settings
     p = tmp_path / "s.toml"
     p.write_text('[trial_budget]\nga_weekly_enabled = "false"\nga_full_search = 5000\n', encoding="utf-8")
     s = settings.load(p)
-    assert s.trial_budget.ga_weekly_enabled is False and s.trial_budget.ga_full_search == 500
+    assert s.trial_budget.ga_weekly_enabled is True and s.trial_budget.ga_full_search == 500
     assert len(s.warnings) == 2

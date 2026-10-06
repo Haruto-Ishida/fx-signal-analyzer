@@ -261,6 +261,7 @@ class SearchResult:
     top: list[tuple[int, int, int]]  # 適応度の高い順の組み合わせ（重複なし）
     trials: list[dict] = field(default_factory=list)  # 試行の記録用
     kind: str = "full"               # full（本格的な探索）/ neighborhood（上位候補の周辺だけ）
+    trace: list[float] = field(default_factory=list)  # 評価した順の適応度（何通り目で最良が見つかったかの確認用）
 
 
 def _setup_creator():
@@ -296,13 +297,15 @@ def _result(ev: _Evaluator, seed: int, budget: int, kind: str, base_p: Indicator
     from .trials import strategy_config
     rows = [{"genome": g, "key": key_of(g), "rule": describe(g), "fitness": f.score, "trades": f.n_trades,
              "total_pips": f.total_pips, "segment_sharpe": f.segment_sharpe} for g, f in ev.cache.items()]
-    df = pd.DataFrame(rows).sort_values("fitness", ascending=False, kind="stable").reset_index(drop=True)
+    cols = ["genome", "key", "rule", "fitness", "trades", "total_pips", "segment_sharpe"]
+    df = pd.DataFrame(rows, columns=cols).sort_values("fitness", ascending=False, kind="stable").reset_index(drop=True)
     top = [tuple(g) for g in df["genome"].head(top_k)]
     tr = [{"family": "strategy", "name": "ga", "purpose": f"ga_{kind}",
            "config": strategy_config(r["key"], base_p, ev.risk, ev.rules, spec={"ga_genes": genes_of(r["genome"])}),
            "metrics": {"fitness": r["fitness"], "trades": r["trades"], "total_pips": r["total_pips"], "seed": seed}}
           for r in rows]
-    return SearchResult(seed, budget, df, top, tr, kind)
+    trace = [float(f.score) for f in ev.cache.values()]  # dict は入れた順を保つ＝評価した順
+    return SearchResult(seed, budget, df, top, tr, kind, trace)
 
 
 def search(dev: pd.DataFrame, risk: RiskParams, rules: bt.ExitRules, costs: bt.Costs, pip: float, budget: int,
@@ -371,8 +374,10 @@ def neighbors(genome) -> list[tuple[int, int, int]]:
 
 def neighborhood_search(dev: pd.DataFrame, previous_top: list, risk: RiskParams, rules: bt.ExitRules, costs: bt.Costs,
                         pip: float, budget: int, seed: int, holdout_start: pd.Timestamp | None = None, mult=None,
-                        base_p: IndicatorParams = IndicatorParams()) -> SearchResult:
-    """週末の再探索：前回の上位候補と、その周辺（遺伝子を1つだけ変えたもの）だけを、budget まで評価する。"""
+                        base_p: IndicatorParams = IndicatorParams(), skip=frozenset()) -> SearchResult:
+    """定期的な再探索：これまでの上位候補の周辺（遺伝子を1つだけ変えたもの）のうち、まだ評価していないもの（skip にないもの）
+    だけを、budget まで評価する。開発用データは境界で固定されていて変わらないので、評価済みの組み合わせを評価し直しても
+    同じ結果になるだけ（予算と時間のむだ）なので、評価し直さない。"""
     if holdout_start is not None and len(dev) and dev.index[-1] >= holdout_start:
         from .holdout import FinalTestAccessError
         raise FinalTestAccessError("最終テスト期間のデータが GA の探索に渡されています")
@@ -384,8 +389,10 @@ def neighborhood_search(dev: pd.DataFrame, previous_top: list, risk: RiskParams,
         nb = neighbors(g)
         rnd.shuffle(nb)
         cands += nb
+    done = {canonical(g) for g in skip}
     for g in dict.fromkeys(cands):
         if ev.remaining <= 0:
             break
-        ev(g)
+        if g not in done:
+            ev(g)
     return _result(ev, seed, budget, "neighborhood", base_p)

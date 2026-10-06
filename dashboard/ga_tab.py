@@ -4,11 +4,38 @@ from __future__ import annotations
 import json
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from fxtool import data, ga, ga_jobs, trials
 
 from .common import Context, fmt_pips
+
+
+def render_convergence(trace: list[float], cap: int) -> None:
+    """本格的な探索で、何通り目で最良の候補が見つかり、それ以降は改善しなかったかのグラフ。"""
+    conv = ga_jobs.convergence(trace)
+    if conv is None:
+        return
+    st.markdown("#### 何通り目で最良の候補が見つかったか（最初の本格的な探索）")
+    x = list(range(1, conv.n + 1))
+    y = [max(v, -3.0) for v in trace]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y, mode="markers", name="それぞれの組み合わせの適応度",
+                             marker=dict(size=4, color="#9e9e9e")))
+    fig.add_trace(go.Scatter(x=x, y=conv.best_so_far, mode="lines", name="それまでの最良", line=dict(color="#2962ff", width=3)))
+    fig.add_vline(x=conv.best_at, line_dash="dash", line_color="#e53935",
+                  annotation_text=f"最良が見つかった：{conv.best_at}通り目", annotation_position="top left")
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="評価した順番（何通り目）",
+                      yaxis_title="適応度（−3 未満は −3 で表示）", legend=dict(orientation="h"))
+    st.plotly_chart(fig, width="stretch")
+    st.markdown(
+        f"- 全部で **{conv.n} 通り**評価し、最良の候補が見つかったのは **{conv.best_at} 通り目**。"
+        f"それ以降の {conv.n - conv.best_at} 通りでは改善しませんでした。\n"
+        f"- 最良との差が5%以内の候補は **{conv.near_at} 通り目**までに見つかっていました。\n"
+        f"- 再探索の1回の数の目安（自動計算）：**{ga_jobs.suggest_budget(conv, cap)} 通り**"
+        f"（最良が見つかるまでの数の半分。周辺だけを探すので、ゼロからより少なくて済む。上限 {cap}）。"
+    )
 
 
 def render(ctx: Context) -> None:
@@ -33,14 +60,27 @@ def render(ctx: Context) -> None:
     finally:
         con.close()
 
-    per_year = ga_jobs.projected_trials_per_year(s)
     st.caption(
         f"🧮 試した組み合わせ（{ctx.pair}・{ctx.tf.label}の累計）：{n_now:,} 通り。"
         f"本格的な探索を1回すると最大 {tb.ga_full_search} 通り増えます。"
-        f"週末の自動の再探索は **{'有効' if tb.ga_weekly_enabled else '停止中'}**"
-        f"（有効にすると1回 {tb.ga_weekly_search} 通りまで、1年で最大 {52 * tb.ga_weekly_search:,} 通り）。"
-        f"いまの設定での1年分の見込み：最大 {per_year:,} 通り（本格的な探索1回を含む）。"
+        f"定期的な再探索は **{'有効' if tb.ga_weekly_enabled else '停止中'}**"
+        f"（{tb.ga_interval_weeks}週間に1回・日本時間の土曜・1回 {tb.ga_weekly_search} 通りまで。"
+        "これまでの上位候補の周辺のうち、まだ試していない組み合わせだけを調べます）。"
     )
+    with st.expander("📈 累計の試行数の見込みと、合格の基準の厳しさ"):
+        has_full = len(runs) and (runs["kind"] == "full").any()
+        rows = []
+        for y in (1, 4):
+            p = ga_jobs.projection(n_now, s, y, full_runs=0 if has_full else 1)
+            rows.append({"期間": f"{y}年後", "再探索の回数": p["re_search_runs"],
+                         "単純な見込み（通り）": f"{p['naive']:,}", "基準の厳しさ（単純）": f"{p['strict_naive']:.2f}倍",
+                         "実際の上限（通り）": f"{p['capped']:,}", "基準の厳しさ（上限）": f"{p['strict_capped']:.2f}倍"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption(
+            f"「単純な見込み」は、毎回上限まで新しい組み合わせを試した場合。ただし GA の組み合わせは全部で "
+            f"{ga_jobs.search_space_size():,} 通りしかなく、同じ組み合わせは二度数えないので、「実際の上限」を超えることはありません。"
+            f"「基準の厳しさ」は、偶然でも出てしまうシャープレシオの水準（DSR の基準）が、いま（{n_now:,} 通り）の何倍になるかです。"
+        )
     if st.button(f"🧬 開発用データで GA 探索をする（{ctx.pair}・{ctx.tf.label}・最大 {tb.ga_full_search} 通り）",
                  key="ga_run"):
         con = data.connect()
@@ -59,6 +99,9 @@ def render(ctx: Context) -> None:
                 f"{int(r['n_evaluated'])} 通り・シード値 {int(r['seed'])}）")
     st.caption("適応度：開発用データを時間順に5つに分け、区間ごとのシャープレシオ（年率）の平均から、ばらつきと条件の数を差し引いたもの。"
                "どの時期でも安定して良いものほど高くなります。")
+    full = runs[runs["kind"] == "full"]
+    if len(full) and isinstance(full["trace"].iloc[-1], str):
+        render_convergence(json.loads(full["trace"].iloc[-1]), tb.ga_weekly_search)
     st.dataframe(pd.DataFrame({
         "順位": cands["rank"], "ルール": cands["rule"], "適応度": cands["fitness"].round(2),
         "取引回数": cands["trades"], "損益(pips・コスト後)": cands["total_pips"].map(fmt_pips),
