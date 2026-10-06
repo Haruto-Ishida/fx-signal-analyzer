@@ -92,9 +92,12 @@ def build_panel(fx_daily: pd.DataFrame, rates: dict[str, pd.Series], cpi: dict[s
                 cutoff: pd.Timestamp | None = DEV_CUTOFF) -> Panel:
     """FRED のデータから、月ごとの表を作る。cutoff より後のデータは使わない（開発用の期間の検証では DEV_CUTOFF）。"""
     if cutoff is not None:
+        # 月ごと・3か月ごとの値は、その期間の最後の日が cutoff 以前のものだけを使う
+        # （例：2020-10-01 の日付の10月の平均は、10月15日以降を含むので使わない。2026-10-07 の修正）
         fx_daily = fx_daily[fx_daily.index <= cutoff]
-        rates = {k: v[v.index <= cutoff] for k, v in rates.items()}
-        cpi = {k: v[v.index <= cutoff] for k, v in cpi.items()}
+        rates = {k: v[(pd.DatetimeIndex(v.index) + pd.offsets.MonthEnd(0)) <= cutoff] for k, v in rates.items()}
+        cpi = {k: v[(pd.DatetimeIndex(v.index) + (pd.offsets.QuarterEnd(0) if CPI_SERIES[k][1] == "Q"
+                                                  else pd.offsets.MonthEnd(0))) <= cutoff] for k, v in cpi.items()}
     p_daily = usd_per_unit(fx_daily)
     price = month_end(p_daily)
     months = price.index

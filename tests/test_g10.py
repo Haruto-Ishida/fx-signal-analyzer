@@ -35,6 +35,10 @@ def test_cutoff_drops_later_data():
     fx2 = pd.concat([fx, pd.DataFrame(999.0, index=later, columns=fx.columns)])
     pn = g10.build_panel(fx2, rates, cpi)
     assert pn.months[-1] == pd.Period("2020-10", "M") and (pn.price < 900).all().all()
+    # 月ごとの値の日付が境界より前でも、その月の終わりが境界より後なら使わない（2020-10-01 ＝10月の平均）
+    rates3 = {k: pd.concat([v, pd.Series([99.0], index=[pd.Timestamp("2020-10-01")])]) for k, v in rates.items()}
+    pn3 = g10.build_panel(fx, rates3, cpi)
+    assert (pn3.rate_next.max() < 90).all() and (pn3.rate_signal.max() < 90).all()
 
 
 def test_no_lookahead(panel):
