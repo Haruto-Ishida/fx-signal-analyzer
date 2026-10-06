@@ -43,6 +43,7 @@ def test_env_is_ignored_by_git():
 @pytest.mark.parametrize("bad", [
     "残高 100,000円", "損失 1,000 円", "口座の損益", "数量 3,000通貨", "連絡先 someone@example.com",
     r"C:\Users\someone\file", "https://discord.com/api/webhooks/1/abc",
+    "https://api.stlouisfed.org/fred/series?api_key=0123456789abcdef0123456789abcdef", "0123456789abcdef0123456789abcdef",
 ])
 def test_unsafe_messages_are_blocked(con, bad):
     s = Sender()

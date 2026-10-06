@@ -39,6 +39,7 @@ FORBIDDEN = [
     (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "メールアドレス"),
     (re.compile(r"[A-Za-z]:\\\\|[A-Za-z]:\\|/Users/|\\Users\\"), "パソコンの中の場所"),
     (re.compile(r"discord(app)?\.com/api/webhooks", re.I), "Webhook の URL"),
+    (re.compile(r"api_key|FRED_API_KEY|\b[0-9a-f]{32}\b", re.I), "API キー"),
 ]
 
 
