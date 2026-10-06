@@ -69,6 +69,60 @@ def fingerprint(prereg: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+# ---------------- ファイルの読み込み（ユーザーが公式サイトから手作業でダウンロードしたもの） ----------------
+
+def _tz_offset(header: str) -> pd.Timedelta:
+    """Dukascopy の CSV の時刻の列名（例：「Time (Asia/Tokyo)」「Gmt time」「Time (UTC)」）から、UTC との差を決める。
+    夏時間のない時間帯だけを受け付ける（夏時間がある時間帯は、時刻を一意に直せないため止める）。"""
+    h = header.lower()
+    if "tokyo" in h or "jst" in h:
+        return pd.Timedelta(hours=9)
+    if "gmt" in h or "utc" in h:
+        return pd.Timedelta(0)
+    raise ValueError(f"時刻の時間帯がわかりません：{header}（GMT/UTC か Asia/Tokyo でダウンロードしてください）")
+
+
+def load_dukascopy_side(path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.columns = [c.strip() for c in df.columns]
+    tcol = df.columns[0]
+    off = _tz_offset(tcol)
+    idx = pd.to_datetime(df[tcol].str.strip(), format="%Y.%m.%d %H:%M:%S") - off
+    out = pd.DataFrame({k.lower(): df[k].astype(float) for k in ("Open", "High", "Low", "Close", "Volume")})
+    out.index = pd.DatetimeIndex(idx, name="ts")
+    return out[~out.index.duplicated(keep="first")].sort_index()
+
+
+def load_dukascopy(bid_path, ask_path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """戻り値：（中値の1時間足、Bid の1時間足）。時刻は UTC・足の開始時刻。取引のない足（出来高0で値動きなし＝週末など）は除く。"""
+    bid, ask = load_dukascopy_side(bid_path), load_dukascopy_side(ask_path)
+    common = bid.index.intersection(ask.index)
+    bid, ask = bid.loc[common], ask.loc[common]
+    flat = (bid["volume"] <= 0) & (bid["high"] == bid["low"])
+    bid, ask = bid[~flat], ask[~flat]
+    mid = (bid[["open", "high", "low", "close"]] + ask[["open", "high", "low", "close"]]) / 2
+    return mid, bid[["open", "high", "low", "close"]]
+
+
+def load_histdata(paths) -> pd.DataFrame:
+    """HistData の Generic ASCII・1分足（Bid・米国東部の標準時、夏時間なし＝UTC−5 固定）の ZIP を読み、
+    UTC の1時間足（足の開始時刻）にまとめる。"""
+    import zipfile
+    parts = []
+    for p in sorted(paths):
+        with zipfile.ZipFile(p) as z:
+            name = [n for n in z.namelist() if n.lower().endswith(".csv")][0]
+            with z.open(name) as fh:
+                d = pd.read_csv(fh, sep=";", header=None, names=["t", "open", "high", "low", "close", "volume"])
+        d.index = pd.to_datetime(d["t"], format="%Y%m%d %H%M%S") + pd.Timedelta(hours=5)
+        parts.append(d[["open", "high", "low", "close"]])
+    m1 = pd.concat(parts).sort_index()
+    m1 = m1[~m1.index.duplicated(keep="first")]
+    h1 = m1.resample("h").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    h1.index.name = "ts"
+    return h1
+
+
 # ---------------- データ元のずれの確認 ----------------
 
 def compare_sources(a: pd.DataFrame, b: pd.DataFrame, pip: float) -> dict:

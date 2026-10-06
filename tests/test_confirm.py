@@ -81,3 +81,34 @@ def test_consistency_check():
     b["close"] += 0.05                                           # 5.5 pips のずれ → 止める
     assert not confirm.consistency_ok(confirm.compare_sources(a, b, 0.01), lim)[0]
     assert not confirm.consistency_ok(confirm.compare_sources(a, b.iloc[::2], 0.01), lim)[0]
+
+
+def test_load_dukascopy_converts_tokyo_time_and_drops_flats(tmp_path):
+    rows = ["Time (Asia/Tokyo),Open,High,Low,Close,Volume ",
+            "2013.01.07 09:00:00,87.0,87.2,86.9,87.1,100.0",
+            "2013.01.07 10:00:00,87.1,87.3,87.0,87.2,120.0",
+            "2013.01.12 09:00:00,87.2,87.2,87.2,87.2,0.0"]          # 土曜：出来高0・値動きなし → 除く
+    bid = tmp_path / "bid.csv"
+    bid.write_text("\n".join(rows), encoding="utf-8")
+    ask = tmp_path / "ask.csv"
+    ask.write_text("\n".join(r.replace("87.0,", "87.02,") if i else r for i, r in enumerate(rows)), encoding="utf-8")
+    mid, b = confirm.load_dukascopy(bid, ask)
+    assert list(mid.index) == [pd.Timestamp("2013-01-07 00:00"), pd.Timestamp("2013-01-07 01:00")]  # 日本時間 −9時間
+    assert b["open"].iat[0] == 87.0 and mid["open"].iat[0] == pytest.approx(87.01)
+    with pytest.raises(ValueError):
+        confirm._tz_offset("Time (America/New_York)")       # 夏時間のある時間帯は受け付けない
+
+
+def test_load_histdata_shifts_est_and_makes_hourly_bars(tmp_path):
+    import zipfile
+    lines = ["20130107 040000;87.00;87.10;86.90;87.05;0",       # 米国東部の標準時 4:00 ＝ UTC 9:00
+             "20130107 043000;87.05;87.30;87.00;87.20;0",
+             "20130107 045900;87.20;87.25;87.10;87.15;0",
+             "20130107 050000;87.15;87.16;87.14;87.16;0"]
+    p = tmp_path / "HISTDATA_COM_ASCII_USDJPY_M12013.zip"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("DAT_ASCII_USDJPY_M1_2013.csv", "\n".join(lines))
+    h = confirm.load_histdata([p])
+    assert list(h.index) == [pd.Timestamp("2013-01-07 09:00"), pd.Timestamp("2013-01-07 10:00")]
+    r = h.iloc[0]
+    assert (r.open, r.high, r.low, r.close) == (87.00, 87.30, 86.90, 87.15)
