@@ -36,7 +36,8 @@ class ReviewStatus:
             head = f"{self.pair} {'1時間足' if self.tf == '1h' else '日足'}：年1回の見直しの時期（{when}）を {-self.days_left} 日過ぎています。"
         else:
             head = f"{self.pair} {'1時間足' if self.tf == '1h' else '日足'}：年1回の見直しの時期（{when}）まで、あと {self.days_left} 日です。"
-        return head + "検証に使う期間を新しくして選び直すかどうか、決めてください（自動では行いません）。"
+        return head + ("検証に使う期間を新しくして選び直すかどうか、決めてください（自動では行いません）。"
+                       "先に「振り返り報告書_2026-10.md」を読み返し、本番の記録（ペーパートレード）がどれくらいたまったかを確かめてください。")
 
 
 def status(pair: str, tf: str, now: pd.Timestamp, r: Review | None = None, path=None) -> ReviewStatus | None:
