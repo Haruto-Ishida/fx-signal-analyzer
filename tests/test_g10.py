@@ -108,3 +108,17 @@ def test_haircut_reference_is_worse(panel):
     a = g10.dev_window(g10.monthly_returns(w, panel, CM))["total"].sum()
     b = g10.dev_window(g10.monthly_returns(w, panel, g10.CostModel(CM.one_way, 0.010)))["total"].sum()
     assert b < a
+
+
+def test_single_gap_is_filled_with_previous_month():
+    s = pd.Series([1.0, 2.0, np.nan, 4.0], index=pd.period_range("2020-01", periods=4, freq="M"), name="X")
+    assert list(g10.fill_single_gaps(s)) == [1.0, 2.0, 2.0, 4.0]
+    two = pd.Series([1.0, np.nan, np.nan, 4.0], index=s.index, name="X")
+    with pytest.raises(ValueError):
+        g10.fill_single_gaps(two)
+    # 先頭・末尾の欠け（データの範囲の外）は埋めない
+    edge = pd.Series([np.nan, 2.0, 3.0, np.nan], index=s.index, name="X")
+    assert g10.fill_single_gaps(edge).isna().tolist() == [True, False, False, True]
+    # 日付の飛び（その月の行がない）も欠けとして扱う
+    raw = pd.Series([1.0, 3.0], index=pd.to_datetime(["2020-01-01", "2020-03-01"]))
+    assert list(g10.fill_single_gaps(g10.monthly_with_gaps(raw, "X"))) == [1.0, 1.0, 3.0]

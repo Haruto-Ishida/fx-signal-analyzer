@@ -61,10 +61,33 @@ def month_end(daily: pd.DataFrame) -> pd.DataFrame:
     return d.groupby(d.index.to_period("M")).last()
 
 
+def monthly_with_gaps(series: pd.Series, name: str = "") -> pd.Series:
+    """月ごとの値（欠けた月は NaN のまま、月を飛ばさない）。"""
+    s = series.astype(float).copy()
+    s.index = pd.DatetimeIndex(s.index).to_period("M")
+    s = s.groupby(level=0).last()
+    if len(s):
+        s = s.reindex(pd.period_range(s.index.min(), s.index.max(), freq="M"))
+    s.name = name or series.name
+    return s
+
+
 def monthly(series: pd.Series) -> pd.Series:
     s = series.dropna().astype(float)
     s.index = pd.DatetimeIndex(s.index).to_period("M")
     return s.groupby(level=0).last()
+
+
+def fill_single_gaps(s: pd.Series) -> pd.Series:
+    """途中で1か月だけ欠けている月を、前の月の値で埋める（2026-10-07 の修正。米国の金利の 2020-04 が欠けていたため）。
+    2か月以上続けて欠けている場合は、事前登録の決まりどおり止める。"""
+    s = s.copy()
+    inner = s.loc[s.first_valid_index():s.last_valid_index()] if s.notna().any() else s
+    gaps = inner.isna()
+    if (gaps & gaps.shift(1, fill_value=False)).any():
+        raise ValueError(f"{s.name}：2か月以上続けて欠けている月があります")
+    s.loc[gaps[gaps].index] = s.shift(1).loc[gaps[gaps].index]
+    return s
 
 
 def quarterly_available(q: pd.Series, months: pd.PeriodIndex) -> pd.Series:
@@ -102,7 +125,7 @@ def build_panel(fx_daily: pd.DataFrame, rates: dict[str, pd.Series], cpi: dict[s
     price = month_end(p_daily)
     months = price.index
     spot_next = price.shift(-1) / price - 1
-    r = pd.DataFrame({c: monthly(rates[c]) for c in ALL}).reindex(months)
+    r = pd.DataFrame({c: fill_single_gaps(monthly_with_gaps(rates[c], c)) for c in ALL}).reindex(months)
     rate_signal = r.shift(RATE_LAG)
     rate_next = r.shift(-1)
     cols = {}
