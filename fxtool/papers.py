@@ -116,8 +116,10 @@ def save(con: sqlite3.Connection, papers: list[Paper], now: pd.Timestamp) -> int
 _last_call = [0.0]
 
 
-def download(url: str, timeout: float = 30.0) -> str:
-    """arXiv に問い合わせる（外部への接続）。前回から3秒以上あける。"""
+def download(url: str, timeout: float = 90.0) -> str:
+    """arXiv に問い合わせる（外部への接続）。前回から3秒以上あける。
+    条件が多い検索は arXiv 側で時間がかかるので、待ち時間は長め（90秒）。混んでいると 429（問い合わせが多すぎる）が返るので、
+    そのときは時間をおいてからやり直す（すぐに何度もやり直さない）。"""
     wait = MIN_INTERVAL_SEC - (time.monotonic() - _last_call[0])
     if wait > 0:
         time.sleep(wait)
