@@ -56,10 +56,10 @@ def run(con: sqlite3.Connection, pair: str, tf: str, kind: str = "full", seed: i
         trials.record(con, res.trials, pair=pair, tf=tf, origin=origin, now=now, data_from=dev.index[0],
                       data_to=dev.index[-1], n_bars=len(dev), note=f"GA {kind} seed={seed} budget={budget}")
     cur = con.execute(
-        """INSERT INTO ga_runs (pair, tf, kind, seed, budget, n_evaluated, started_at, data_from, data_to, origin, trace)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO ga_runs (pair, tf, kind, seed, budget, n_evaluated, started_at, data_from, data_to, origin, trace,
+           pbo, sr_var) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (pair, tf, kind, seed, budget, len(res.evaluated), ts_str(now), ts_str(dev.index[0]), ts_str(dev.index[-1]), origin,
-         json.dumps([round(x, 5) for x in res.trace])))
+         json.dumps([round(x, 5) for x in res.trace]), jobs._num(res.pbo), jobs._num(res.sr_variance)))
     run_id = cur.lastrowid
     if res.evaluated.empty:
         con.commit()
@@ -95,6 +95,18 @@ def validate(con: sqlite3.Connection, pair: str, tf: str, run_id: int, top_n: in
     n_trials = trials.count_with(con, pair, tf, planned, dev.index[0], dev.index[-1])
     rep = bt.evaluate_all(dev, jobs.P, jobs.RISK, rules, costs, pip, runs=runs, holdout_start=b.start,
                           rw_paths=rw_paths, n_trials=n_trials, strategy_list=sts, spread_mult=mult)
+    # 候補は「全通り（または探索した組み合わせ）の中から一番良いものを選んだ」結果なので、その選び方の割り引きを使う：
+    # - DSR のばらつきは、検証する数個の候補（似たものばかり）ではなく、評価したすべての組み合わせから求めた値（大きい方）
+    # - PBO は、すべての組み合わせから選ぶことの過学習の確率
+    run = con.execute("SELECT pbo, sr_var FROM ga_runs WHERE id=?", (run_id,)).fetchone()
+    if run is not None and run[1] is not None:
+        from . import overfit
+        var = max(float(run[1]), rep.sr_variance if rep.sr_variance == rep.sr_variance else 0.0)
+        for r in rep.reports:
+            r.dsr = overfit.deflated_sharpe(r.wf_daily.to_numpy(), rep.n_trials, var)
+            r.pbo = {"pbo": float("nan") if run[0] is None else float(run[0])}
+            r.verdict = bt.assess(r.wf, r.wf_beat, rep.k, r.dsr.get("dsr", float("nan")), r.pbo["pbo"],
+                                  r.rw_beat, r.yearly_wf)
     trials.record(con, rep.trials, pair=pair, tf=tf, origin=origin, now=now, data_from=dev.index[0],
                   data_to=dev.index[-1], n_bars=len(dev), note=f"GA の候補の検証（run {run_id}）")
     for rank, r in zip(cands["rank"], rep.reports):

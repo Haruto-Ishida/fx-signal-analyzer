@@ -109,6 +109,10 @@ def render(ctx: Context) -> None:
                "どの時期でも安定して良いものほど高くなります（0 より大きければ、平均してプラス）。")
     if r["kind"] == "exhaustive" and isinstance(r["trace"], str):
         render_distribution(json.loads(r["trace"]))
+        if pd.notna(r.get("pbo")):
+            st.caption(f"「{int(r['n_evaluated']):,} 通りの中から一番を選ぶ」こと自体の過学習の確率（PBO）：**{r['pbo']:.0%}**"
+                       "（50% 以上なら、過去で一番だった組み合わせが、この先は平均以下になりやすい）。"
+                       "下の検証の DSR・PBO は、この選び方の割り引きを使っています。")
     full = runs[runs["kind"] == "full"]
     if r["kind"] != "exhaustive" and len(full) and isinstance(full["trace"].iloc[-1], str):
         render_convergence(json.loads(full["trace"].iloc[-1]), s.trial_budget.ga_weekly_search)

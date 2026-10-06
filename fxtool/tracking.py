@@ -177,8 +177,9 @@ def migrate(con: sqlite3.Connection) -> None:
     from .trials import migrate as migrate_trials
     migrate_trials(con)
     # 2026-10-07：GA の評価した順の適応度（何通り目で最良が見つかったかのグラフ用）
-    if "trace" not in _columns(con, "ga_runs"):
-        con.execute("ALTER TABLE ga_runs ADD COLUMN trace TEXT")
+    for c in ("trace TEXT", "pbo REAL", "sr_var REAL"):
+        if c.split()[0] not in _columns(con, "ga_runs"):
+            con.execute(f"ALTER TABLE ga_runs ADD COLUMN {c}")
     # Step 6：GA の候補の検証結果
     ga_cols = _columns(con, "ga_candidates")
     for c, typ in (("verdict", "TEXT"), ("reason", "TEXT"), ("wf_total", "REAL"), ("wf_n", "INTEGER"),

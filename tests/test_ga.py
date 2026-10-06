@@ -281,3 +281,26 @@ def test_review_projection():
     assert p0["trials"] == 89 + 1064 and p1["trials"] == 89 + 1064 + 1104
     assert p4["trials"] == 89 + 4 * 1104
     assert 1 < p0["strict"] < p1["strict"] < p4["strict"]
+
+def test_exhaustive_reports_selection_pbo_and_variance(tmp_db):
+    """全通りの中から選ぶことの割り引き：PBO と、全組み合わせのシャープレシオのばらつき。検証の DSR はそれを使う。"""
+    from fxtool import ga_jobs
+    run_id = ga_jobs.run(tmp_db, "EUR/JPY", "1d", "exhaustive")
+    pbo, var = tmp_db.execute("SELECT pbo, sr_var FROM ga_runs WHERE id=?", (run_id,)).fetchone()
+    assert 0 <= pbo <= 1 and var > 0
+    ga_jobs.validate(tmp_db, "EUR/JPY", "1d", run_id, top_n=2, runs=10, rw_paths=2)
+    c = ga_jobs.load_candidates(tmp_db, run_id).head(2)
+    assert (c["pbo"] == pbo).all()       # 候補ごとの PBO ではなく、選び方全体の PBO
+
+
+def test_pbo_in_chunks_matches_single_pass(monkeypatch):
+    import numpy as np
+    from fxtool import overfit
+    rng = np.random.default_rng(0)
+    m = pd.DataFrame(rng.normal(0, 1, (200, 40)))
+    a = overfit.pbo_cscv(m)                     # 設定が少ない → 1回で計算
+    b = overfit.pbo_cscv(m.copy())
+    assert a["pbo"] == b["pbo"] and len(a["logits"]) == 12870
+    # 設定が多い（3,000）→ 少しずつ計算する。どれも実力ゼロなので PBO は 0.5 前後、分け方はすべて計算される
+    big = overfit.pbo_cscv(pd.DataFrame(rng.normal(0, 1, (200, 3000))))
+    assert 0.2 < big["pbo"] < 0.8 and len(big["logits"]) == 12870 and np.isfinite(big["logits"]).all()

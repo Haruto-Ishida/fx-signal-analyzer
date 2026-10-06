@@ -228,6 +228,7 @@ class Fitness:
     n_trades: int
     segment_sharpe: list[float]
     total_pips: float
+    daily: np.ndarray | None = None  # 開発用データ全体の、日ごとの損益（PBO と、DSR のばらつきの計算用）
 
 
 def fitness(ind: pd.DataFrame, genome, risk: RiskParams, rules: bt.ExitRules, costs: bt.Costs, pip: float,
@@ -239,16 +240,16 @@ def fitness(ind: pd.DataFrame, genome, risk: RiskParams, rules: bt.ExitRules, co
     trades = bt.simulate_raw(bars, sig, risk, rules, costs, pip, bt.WARMUP, n)
     n_tr = len(trades)
     total = float(sum(t[9] for t in trades))
-    if n_tr < MIN_TRADES_FOR_FITNESS:
-        return Fitness(-10.0, n_tr, [], total)
     days = overfit.business_days(ind.index[bt.WARMUP], ind.index[-1])
-    daily = overfit.daily_pnl(ind.index[[t[3] for t in trades]], [t[9] for t in trades], days)
-    segs = np.array_split(daily.to_numpy(), N_SEGMENTS)
+    daily = overfit.daily_pnl(ind.index[[t[3] for t in trades]], [t[9] for t in trades], days).to_numpy()
+    if n_tr < MIN_TRADES_FOR_FITNESS:
+        return Fitness(-10.0, n_tr, [], total, daily)
+    segs = np.array_split(daily, N_SEGMENTS)
     srs = [overfit.annualized(overfit.sharpe(s)) for s in segs]
     score = float(np.mean(srs) - 0.5 * np.std(srs) - 0.1 * (complexity(genome) - 1))
     if n_tr < bt.MIN_TRADES_RELIABLE:
         score -= 1.0
-    return Fitness(score, n_tr, srs, total)
+    return Fitness(score, n_tr, srs, total, daily)
 
 
 # ---------------- 探索 ----------------
@@ -262,6 +263,8 @@ class SearchResult:
     trials: list[dict] = field(default_factory=list)  # 試行の記録用
     kind: str = "full"               # full（本格的な探索）/ neighborhood（上位候補の周辺だけ）
     trace: list[float] = field(default_factory=list)  # 評価した順の適応度（何通り目で最良が見つかったかの確認用）
+    pbo: float = float("nan")        # 全通りの評価：「1,064通りの中から一番を選ぶ」こと自体の過学習の確率（CSCV）
+    sr_variance: float = float("nan")  # 全通りの評価：組み合わせどうしの、日ごとのシャープレシオのばらつき（DSR 用）
 
 
 def _setup_creator():
@@ -379,7 +382,13 @@ def exhaustive_search(dev: pd.DataFrame, risk: RiskParams, rules: bt.ExitRules, 
     ev = _Evaluator(ind, risk, rules, costs, pip, len(genomes), mult)
     for g in genomes:
         ev(g)
-    return _result(ev, 0, len(genomes), "exhaustive", base_p)
+    res = _result(ev, 0, len(genomes), "exhaustive", base_p)
+    # 「全通りの中から一番を選ぶ」ことの割り引き：全組み合わせの日ごとの損益から PBO と、シャープレシオのばらつきを計算する
+    mat = pd.DataFrame({key_of(g): f.daily for g, f in ev.cache.items() if f.daily is not None})
+    if mat.shape[1] >= 2:
+        res.pbo = float(overfit.pbo_cscv(mat)["pbo"])
+        res.sr_variance = float(mat.apply(overfit.sharpe).var(ddof=1))
+    return res
 
 
 def neighbors(genome) -> list[tuple[int, int, int]]:

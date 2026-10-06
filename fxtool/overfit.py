@@ -89,21 +89,29 @@ def pbo_cscv(matrix: pd.DataFrame, n_splits: int = 16) -> dict:
         with np.errstate(divide="ignore", invalid="ignore"):
             return np.where(sd > 0, m1 / sd, 0.0)
 
-    is_sr, oos_sr = sr(is_mask), sr(oos_mask)                                # (C, N)
-    best = is_sr.argmax(axis=1)
-    chosen_oos = oos_sr[np.arange(len(combos)), best]
-    # 検証側での順位（1 = 最下位、N = 最上位）。同じ値は平均の順位
-    rank = (oos_sr < chosen_oos[:, None]).sum(axis=1) + ((oos_sr == chosen_oos[:, None]).sum(axis=1) + 1) / 2
-    omega = rank / (N + 1)
-    logits = np.log(omega / (1 - omega))
+    # 設定が多い（全通りの評価で 1,000 以上）とメモリを多く使うので、分け方を少しずつ計算する（結果は同じ）
+    chunk = max(1, 2_000_000 // max(N, 1))
+    logits, is_best, chosen = [], [], []
+    for a in range(0, len(combos), chunk):
+        im, om = is_mask[a:a + chunk], oos_mask[a:a + chunk]
+        is_sr, oos_sr = sr(im), sr(om)                                       # (C, N)
+        best = is_sr.argmax(axis=1)
+        chosen_oos = oos_sr[np.arange(len(im)), best]
+        # 検証側での順位（1 = 最下位、N = 最上位）。同じ値は平均の順位
+        rank = (oos_sr < chosen_oos[:, None]).sum(axis=1) + ((oos_sr == chosen_oos[:, None]).sum(axis=1) + 1) / 2
+        omega = rank / (N + 1)
+        logits.append(np.log(omega / (1 - omega)))
+        is_best.append(is_sr[np.arange(len(im)), best])
+        chosen.append(chosen_oos)
+    logits, is_best, chosen = np.concatenate(logits), np.concatenate(is_best), np.concatenate(chosen)
     return {
         "pbo": float((logits <= 0).mean()),
         "n_configs": N,
         "n_splits": n_splits,
         "logits": logits,
-        "is_sr": is_sr[np.arange(len(combos)), best],
-        "oos_sr": chosen_oos,
-        "prob_oos_loss": float((chosen_oos < 0).mean()),
+        "is_sr": is_best,
+        "oos_sr": chosen,
+        "prob_oos_loss": float((chosen < 0).mean()),
     }
 
 
