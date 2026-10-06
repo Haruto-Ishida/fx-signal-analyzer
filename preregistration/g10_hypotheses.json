@@ -1,0 +1,102 @@
+{
+  "title": "G10 通貨の5つの仮説の検証（事前登録）",
+  "registered_at": "2026-10-07",
+  "status": "固定（検証が終わるまで変更禁止）",
+  "plan": "preregistration/g10_plan.md（最終テスト期間の扱いは、その2章で事前登録済み）",
+  "code": "fxtool/g10.py（計算は下の fingerprint で固定）",
+  "fingerprint": "03b9df66e290a7c3",
+
+  "universe": {
+    "currencies": ["USD", "EUR", "JPY", "GBP", "CHF", "AUD", "NZD", "CAD", "SEK", "NOK"],
+    "plain": "米ドル以外の9通貨を、米ドルに対して買う・売る。損益はその合計（月ごと）"
+  },
+  "periods": {
+    "dev_returns": "2012-01 〜 2020-09（月ごとの損益。2011-12 末に決めたポジションから）",
+    "dev_data_cutoff": "2020-10-14（これより後のデータは読み込まない。最終テスト期間の共通の境界 2020-10-15 の前日）",
+    "lookback_data_from": "2005-01（バリューの5年前との比較と、発表の遅れのため）",
+    "final_test": "g10_plan.md の2章のとおり（DSR 以外の条件をすべて満たした仮説だけ、1回だけ）"
+  },
+
+  "data": {
+    "source": "FRED（米国セントルイス連銀）の公式 API。自分の分析だけに使い、配らない（OECD のデータは著作物）",
+    "fx": {"series": {"EUR": "DEXUSEU", "JPY": "DEXJPUS（逆数）", "GBP": "DEXUSUK", "CHF": "DEXSZUS（逆数）", "AUD": "DEXUSAL",
+                      "NZD": "DEXUSNZ", "CAD": "DEXCAUS（逆数）", "SEK": "DEXSDUS（逆数）", "NOK": "DEXNOUS（逆数）"},
+           "plain": "H.10 の為替レート（ニューヨークの正午・毎営業日）。月末＝その月の最後の値。1通貨あたり何米ドルかにそろえる"},
+    "rates": {"series": "IR3TIB01{US,EZ,JP,GB,CH,AU,NZ,CA,SE,NO}M156N（OECD の3か月物の銀行間金利・月ごとの平均）"},
+    "cpi": {
+      "series": {"USD": "CPIAUCNS（米労働統計局・月ごと）", "EUR": "CP0000EZ19M086NEST（Eurostat の HICP・ユーロ圏19か国・月ごと）",
+                 "JPY": "JPNCPIALLMINMEI（総務省統計局の CPI を OECD がまとめたもの・月ごと）",
+                 "GBP": "GBRCPIALLMINMEI（英国統計局・OECD・月ごと）", "CHF": "CHECPIALLMINMEI（スイス連邦統計局・OECD・月ごと）",
+                 "AUD": "AUSCPIALLQINMEI（豪州統計局・OECD・3か月ごと）", "NZD": "NZLCPIALLQINMEI（NZ 統計局・OECD・3か月ごと）",
+                 "CAD": "CANCPIALLMINMEI（カナダ統計局・OECD・月ごと）", "SEK": "SWECPIALLMINMEI（スウェーデン統計局・OECD・月ごと）",
+                 "NOK": "NORCPIALLMINMEI（ノルウェー統計局・OECD・月ごと）"},
+      "plain": "米国とユーロ圏以外は、各国の統計局の総合 CPI を OECD がまとめたもの（FRED にある各国の統計局のデータはこれだけ）",
+      "final_test_gap": "最終テストで、FRED のデータが終わった後の月（日本は 2021-07 以降、英国・カナダ・スウェーデンは 2025-04 以降など）は、各国の統計局の公式発表（日本：総務省統計局 e-Stat、英国：ONS、スイス：連邦統計局、豪州：ABS、NZ：Stats NZ、カナダ：StatCan、スウェーデン：SCB、ノルウェー：SSB）の総合 CPI を、FRED のデータと最後に重なる月の比でつないで使う",
+      "known_limits": "FRED の値は現在の値（あとで直された値を含む）で、当時発表された値ではない。物価の修正は小さいので、遅れを長めにとって補う"
+    },
+    "check_before_test": "取得後、2005-01〜2020-10-14 の範囲で、為替は各通貨の欠けた営業日が5%以下、金利・物価は欠けた月がないことを確かめる。満たさなければ検証しないで報告する"
+  },
+
+  "timing_and_lags": {
+    "decision": "毎月末（その月の最後の営業日のニューヨークの正午のレート）にポジションを決め、翌月末まで持つ。SBI FXトレードのスプレッドが固定の時間（日本時間 9時〜翌3時）に入る",
+    "rates_for_signal": "ポジションを決める月の、前の月の平均（1か月の遅れ）",
+    "rates_for_pnl": "持っている月の実際の平均（あとからわかる実際の金利差を、受け取り・支払いとして計算する）",
+    "cpi_monthly": "2か月前の値を使う（例：3月末には1月の値）",
+    "cpi_quarterly_AUD_NZD": "四半期の最後の月から3か月たった月末から使い、次の四半期の値が使えるようになるまで同じ値を使う（例：1〜3月の値は6月末から、4〜6月の値は9月末から）"
+  },
+
+  "hypotheses": {
+    "H1": {"name": "時系列モメンタム", "source": "Moskowitz, Ooi, Pedersen (2012) Journal of Financial Economics",
+           "rule": "9通貨それぞれ、過去12か月の「為替の動き＋金利差（前の月の金利で計算、銀行間）」がプラスなら買い、マイナスなら売り。重みはどれも 1/9"},
+    "H2": {"name": "キャリー", "source": "Lustig, Roussanov, Verdelhan (2011) Review of Financial Studies／弱点：Brunnermeier, Nagel, Pedersen (2008)",
+           "rule": "10通貨を前の月の3か月物金利の高い順に並べ、上位3つを買い（各 1/6）、下位3つを売り（各 1/6）。米ドルが選ばれたら、その分は米ドルを持つ"},
+    "H3": {"name": "クロスセクションのモメンタム", "source": "Menkhoff, Sarno, Schmeling, Schrimpf (2012) Journal of Financial Economics",
+           "rule": "10通貨を過去3か月の「為替の動き＋金利差」（米ドルは 0）の大きい順に並べ、上位3つを買い・下位3つを売り（各 1/6）"},
+    "H4": {"name": "バリュー", "source": "Asness, Moskowitz, Pedersen (2013) Journal of Finance／Menkhoff, Sarno, Schmeling, Schrimpf (2017) Review of Financial Studies",
+           "rule": "実質為替レート（1通貨あたりの米ドル × その国の物価 ÷ 米国の物価、物価は遅れ込み）の60か月前からの変化（対数）が小さい＝割安になった順に10通貨（米ドルは 0）を並べ、上位3つを買い・下位3つを売り（各 1/6）"},
+    "H5": {"name": "ボラティリティ調整", "source": "Moreira, Muir (2017) Journal of Finance／Barroso, Santa-Clara (2015) Journal of Financial Economics",
+           "rule": "H1 と同じ方向で、重みを 1/9 × (年10% ÷ その通貨の直近63営業日の値動きの大きさ（年率）) にする（1/9 の2倍まで）"}
+  },
+
+  "costs": {
+    "one_way": {"EUR": 0.0002, "JPY": 0.0002, "GBP": 0.0002, "CHF": 0.0002, "AUD": 0.0002, "NZD": 0.0002, "CAD": 0.0002,
+                "SEK": 0.0015, "NOK": 0.0015},
+    "plain": "1単位を売買するたびに、取引額の 0.02%（主要7通貨）・0.15%（SEK・NOK）を差し引く。主要通貨は SBI FXトレードの今のスプレッド（0.001〜0.025%）より大きく、2012〜2020年の広めのスプレッドも含めた見積もり。SEK・NOK は対米ドルの取引がなく円とのペアで作るので、SEK/円・NOK/円のスプレッド（約 0.12%）に余裕を足した",
+    "swap_haircut": {"judge": 0.005, "reference": 0.010,
+                     "plain": "金利差の受け取り・支払いは、どちらも年0.5%不利にする（判定に使う）。参考に年1.0%でも計算する（判定には使わない）。根拠：2026-09-28 の SBI FXトレードのスワップを年率に直すと、買いと売りの差（業者の取り分）は年0.1〜0.3%、米ドルとのペアでは受け取りが理論値の58〜78%。また翌日物と3か月物の金利のずれが年0.5%前後ある"}
+  },
+
+  "pass_criteria": {
+    "min_months": 90,
+    "min_random_beat": 0.95,
+    "random_runs": 1000,
+    "min_positive_year_ratio": 0.6,
+    "extreme_year_share": 0.5,
+    "max_dd_vol_multiple": 2.5,
+    "min_probability": 0.95,
+    "h5_p_value": 0.05,
+    "plain": [
+      "H1〜H4：次をすべて満たしたら合格。ポジションのあった月が90以上・コスト後の損益（2012-01〜2020-09 の月ごとの損益の合計）がプラス・同じ形のでたらめなポジション（1,000通り）の95%以上を上回る・黒字の年が6割以上（2020年は1〜9月）・1年の損失が利益合計の50%を超える年がない・最大ドローダウンが年間の値動きの大きさの2.5倍以内・偶然ではない確率95%以上",
+      "偶然ではない確率の主な判定：この計画の5つで割り引いた DSR（月ごとの損益、5つの仮説のシャープレシオのばらつきを使う）。参考：1つだけの場合（PSR）、ツール全体の累計で割り引いた場合",
+      "H5：H1 と比べて、シャープレシオが高く、その差がブートストラップ（5,000回）で p < 0.05、かつ最大ドローダウンが小さい",
+      "最終テスト：g10_plan.md の2章。DSR 以外の条件をすべて満たした H1〜H4 だけ、1回だけ"
+    ]
+  },
+
+  "trials": {
+    "count": "+5（仮説1つにつきルール1つ）。pair='G10'・tf='1mo'・source='fred'・期間 2012-01〜2020-09。参考の割り引き（年1.0%）は同じ仮説の計算なので数えない",
+    "tool_total_before": "USD/JPY 1時間足 1,154・日足 95 など（ツール全体の累計は、検証のときに数え直す）"
+  },
+
+  "if_passed": {
+    "broker": "SEK・NOK を含むので、この2通貨を扱い、1通貨単位で取引できる FX 会社（例：SBI FXトレード、松井証券FX）が必要。10万円の口座では、1,000通貨単位の会社では取引できない",
+    "next": "最終テスト（1回だけ）→ 合格ならペーパー口座でのシャドーモード → ユーザーの承認"
+  },
+  "if_all_failed": "g10_plan.md のとおり、新しい仮説はいったん立てずに区切り、振り返りの報告書を作る",
+
+  "not_allowed_until_done": [
+    "ルール・期間・データの系列・遅れ・コスト・割り引き・合格基準を変えること",
+    "結果を見てから、見る期間や月数（12か月・3か月・60か月・上位3つ）を変えて試し直すこと",
+    "2020-10-14 より後のデータを、最終テストより前に読み込むこと"
+  ]
+}
