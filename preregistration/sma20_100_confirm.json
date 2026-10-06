@@ -1,0 +1,61 @@
+{
+  "title": "SMA20/100 クロス候補の確認の検証（事前登録）",
+  "registered_at": "2026-10-07",
+  "status": "固定（検証が終わるまで変更禁止）",
+  "why": "Yahoo Finance の 1時間足（2023-12-19〜2026-03-16 の開発用データ）で 1,064 通りを全部調べて選んだ候補を、選ぶときに一度も見ていない 2013-01-01〜2023-12-18 のデータで、1回だけ試す。",
+  "pair": "USD/JPY",
+  "timeframe": "1h",
+  "rule": {
+    "name": "SMA20 が SMA100 を抜けたら、その方向へ（長い平均の向きに合うときだけ・行き過ぎのときは入らない）",
+    "genes": {"trigger": "ma_20_100", "filters": ["trend_100", "rsi_not_extreme"], "version": "ga-v1"},
+    "strategy_key": "ga_71600cc843",
+    "plain": [
+      "買い：終値の20本平均（SMA20）が100本平均（SMA100）を下から上に抜けた。ただし終値が SMA100 より上、かつ RSI(14) が 70 未満のときだけ",
+      "売り：SMA20 が SMA100 を上から下に抜けた。ただし終値が SMA100 より下、かつ RSI(14) が 30 より大きいときだけ",
+      "シグナルは足が確定してから判定し、次の足の始値で入る"
+    ],
+    "indicator_params": {"sma_short": 20, "sma_long": 75, "rsi_period": 14, "rsi_low": 30, "rsi_high": 70, "macd_fast": 12,
+                         "macd_slow": 26, "macd_signal": 9, "bb_period": 20, "bb_std": 2.0, "atr_period": 14,
+                         "donchian_period": 20},
+    "exits": {"sl_atr": 1.5, "tp_atr": 3.0, "max_bars": 48, "opposite_exit": true,
+              "plain": "損切り ATR(14)×1.5・利確 ATR(14)×3・48本（2日）で時間切れ・反対のシグナルで決済して乗り換え。1本の足で両方に届いたら損切りが先"},
+    "costs": {"spread_pips": 0.3, "slippage_pips": 0.2, "round_trip_pips": 0.7, "time_varying": true,
+              "multipliers": {"event": 3.0, "weekend_open": 3.0, "rollover": 2.0},
+              "plain": "1回の取引で往復 0.7 pips（スプレッド 0.3＋スリッページ 0.2×2）。経済指標の前後・週明けは3倍、ロールオーバーは2倍（いまの設定と同じ）。過去の FOMC・日銀会合の日程は登録がないので、米雇用統計だけが対象"},
+    "code_version": "git 2830488 の計算（指紋で確認）",
+    "fingerprint": "e1b872f23125228d"
+  },
+  "data": {
+    "primary": "Dukascopy（公式サイトから手作業でダウンロード。個人の分析だけに使い、配らない）。USD/JPY・1時間足・Bid と Ask・UTC。中値＝(Bid+Ask)÷2",
+    "cross_check": "HistData.com（Generic ASCII・1分足・Bid・米国東部の標準時固定）を1時間足にまとめて、Dukascopy の Bid と比べる",
+    "download_range": "2012-11-01 〜 2026-03-16（確認の期間の前の準備用と、Yahoo と重なる期間を含む）",
+    "consistency_limits": {
+      "dukascopy_vs_yahoo": {"period": "2023-12-19 〜 2026-03-15", "min_match_ratio": 0.95, "max_median_close_diff_pips": 2.0},
+      "dukascopy_vs_histdata": {"period": "2013-01-01 〜 2023-12-18", "min_match_ratio": 0.90, "max_median_close_diff_pips": 3.0}
+    },
+    "if_inconsistent": "基準を超えたら確認の検証はしないで止め、原因を調べて報告する"
+  },
+  "test_period": {"from": "2013-01-01 00:00:00", "to": "2023-12-18 23:00:00", "timezone": "UTC",
+                  "note": "選ぶときに使った期間（2023-12-19 以降）と、最終テスト期間（2026-03-16 以降）は含めない"},
+  "method": "固定したルールを確認の期間全体で1回だけ動かす（パラメータを選ばないので、ウォークフォワードは使わない）。同じ回数・同じ決済ルールのランダム売買（500回）、ランダムウォークの価格（100通り）と比べ、年ごとの成績も見る",
+  "pass_criteria": {
+    "min_trades": 100,
+    "min_random_beat": 0.95,
+    "min_rw_beat": 0.95,
+    "min_positive_year_ratio": 0.6,
+    "extreme_year": "1年の損失が利益合計の50%を超える年がない",
+    "min_probability": 0.95,
+    "plain": "すべて満たしたら合格。偶然ではない確率は、② 1回だけ試した場合（シャープレシオが0より大きい確率、PSR）と、① 累計の試行数で割り引いた DSR の2通りで判定する"
+  },
+  "cumulative": {
+    "n_trials_before": 1153,
+    "n_trials_counted": "確認の検証の試行（+1：同じ設定でもデータ元と期間が違うので別に数える）を加えた数",
+    "sr_variance": 0.0017281057410669454,
+    "sr_variance_source": "全通りの評価（ga_runs id=2）の、1,064 通りの日ごとのシャープレシオのばらつき"
+  },
+  "not_allowed_until_done": [
+    "ルール・パラメータ・損切り・利確・時間切れ・コスト・期間・合格基準を変えること",
+    "確認の期間のデータで、ほかの組み合わせや最初からある5つの戦略を先に試すこと",
+    "結果を見てから、期間や基準を選び直すこと"
+  ]
+}

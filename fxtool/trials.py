@@ -47,18 +47,22 @@ def _ts(x) -> str | None:
     return None if x is None or (isinstance(x, float) and pd.isna(x)) else pd.Timestamp(x).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def trial_key(chash: str, data_from=None, data_to=None) -> str:
-    """設定 × データの期間。期間がわからない記録（推定の過去分など）は、期間なしとして1つにまとめる。"""
+def trial_key(chash: str, data_from=None, data_to=None, source: str | None = None) -> str:
+    """設定 × データの期間（× データ元）。期間がわからない記録（推定の過去分など）は、期間なしとして1つにまとめる。
+    source（例：dukascopy）は、Yahoo Finance 以外のデータ元を使ったときだけ付ける（同じ期間でも別のデータとして数える）。"""
     period = f"{_ts(data_from) or ''}~{_ts(data_to) or ''}"
+    if source:
+        period = f"{source}:{period}"
     return hashlib.sha1(f"{chash}|{period}".encode()).hexdigest()[:16]
 
 
 def record(con: sqlite3.Connection, rows: list[dict], *, pair: str, tf: str, origin: str, now: pd.Timestamp,
-           data_from=None, data_to=None, n_bars: int | None = None, note: str | None = None) -> int:
-    """rows の各要素：family, name, purpose, config, metrics（任意）。"""
+           data_from=None, data_to=None, n_bars: int | None = None, note: str | None = None,
+           source: str | None = None) -> int:
+    """rows の各要素：family, name, purpose, config, metrics（任意）。source はデータ元（Yahoo 以外のとき）。"""
     def keys(r):
         h = config_hash(r["family"], r["config"])
-        return h, trial_key(h, data_from, data_to)
+        return h, trial_key(h, data_from, data_to, source)
 
     con.executemany(
         """INSERT INTO trials (created_at, pair, tf, family, name, purpose, config, config_hash, trial_key,
@@ -84,11 +88,12 @@ def count(con: sqlite3.Connection, pair: str | None = None, tf: str | None = Non
     return int(con.execute(q, params).fetchone()[0])
 
 
-def count_with(con: sqlite3.Connection, pair: str, tf: str, planned: list[dict], data_from=None, data_to=None) -> int:
+def count_with(con: sqlite3.Connection, pair: str, tf: str, planned: list[dict], data_from=None, data_to=None,
+               source: str | None = None) -> int:
     """記録済みの試行に、これから試す予定の設定（planned。期間は data_from〜data_to）を加えた数。
     同じ処理の中で複数の評価をするとき、すべて同じ「試した数」で割り引くために使う。"""
     have = {r[0] for r in con.execute("SELECT DISTINCT trial_key FROM trials WHERE pair=? AND tf=?", (pair, tf))}
-    return len(have | {trial_key(config_hash(r["family"], r["config"]), data_from, data_to) for r in planned})
+    return len(have | {trial_key(config_hash(r["family"], r["config"]), data_from, data_to, source) for r in planned})
 
 
 def summary(con: sqlite3.Connection, pair: str, tf: str) -> pd.DataFrame:
